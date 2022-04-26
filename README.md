@@ -105,7 +105,7 @@ func main() {
 In Javascript code, one can call the registered function directly. There's the example `b.js`.
 
 ```javascript
-r = adder(1, 100)   # the function "adder" is implemented in Go
+r = adder(1, 100)   // the function "adder" is implemented in Go
 console.log(r)
 ```
 
