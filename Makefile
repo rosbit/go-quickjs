@@ -8,17 +8,15 @@ LIB_QUICKJS = libquickjs.a
 
 all: $(LIB_QUICKJS)
 
-$(QUICKJS_VERSION):
+$(QUICKJS_VERSION): $(PKG)
 	@echo "unpacking $(PKG) ..."
 	tar Jxf $(PKG)
 
-$(PKG): $(QUICKJS_VERSION)
-	@if [ ! -e $(PKG) ]; then \
-		@echo "downloading $@ ..."; \
-		wget $(QUICKJS_SRC); \
-	fi
+$(PKG):
+	@echo "downloading $@ ..."
+	wget $(QUICKJS_SRC)
 
-$(LIB_QUICKJS): $(PKG)
+$(LIB_QUICKJS): $(QUICKJS_VERSION)
 	@echo "building $(QUICKJS_VERSION) ..."
 	(cd $(QUICKJS_VERSION); make)
-	cp -p $(QUICKJS_VERSION)/libquickjs.a .
+	cp -p $(QUICKJS_VERSION)/$(LIB_QUICKJS) .

@@ -9,13 +9,15 @@ can be embedded in Golang application easily.
 
 ### Install
 
-To install go-quickjs, following the steps(in Linux):
+To install go-quickjs, following the steps (under Linux/macos):
 
 1. make sure `gcc`, `make`, `wget` are ready
 2. run `git clone github.com/rosbit/go-quickjs` to clone the source
 3. `cd go-quickjs` to change the directory
 4. run `make` to build the `libquickjs.a`
 5. optionally run `go build`.
+
+### Usage
 
 #### 1. Evaluates expressions
 
