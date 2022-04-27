@@ -30,10 +30,17 @@ import (
 )
 
 func main() {
-  ctx := quickjs.NewContext()
+  ctx, err := quickjs.NewContext()
+  if err != nil {
+    fmt.Printf("%v\n", err)
+    return
+  }
   defer ctx.Free()
 
-  res, _ := ctx.Eval("1 + 2", nil)
+  res, _ := ctx.Eval("a + b", map[string]interface{}{
+     "a": 10,
+     "b": 1,
+  })
   fmt.Println("result is:", res)
 }
 ```
@@ -61,7 +68,11 @@ import (
 var add func(int, int)int
 
 func main() {
-  ctx := quickjs.NewContext()
+  ctx, err := quickjs.NewContext()
+  if err != nil {
+     fmt.Printf("%v\n", err)
+     return
+  }
   defer ctx.Free()
 
   if _, err := ctx.EvalFile("a.js", nil); err != nil {
@@ -95,7 +106,11 @@ func adder(a1 float64, a2 float64) float64 {
 }
 
 func main() {
-  ctx := quickjs.NewContext()
+  ctx, err := quickjs.NewContext()
+  if err != nil {
+      fmt.Printf("%v\n", err)
+      return
+  }
   defer ctx.Free()
 
   if _, err := ctx.EvalFile("b.js", map[string]interface{}{
