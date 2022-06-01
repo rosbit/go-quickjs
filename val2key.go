@@ -112,6 +112,7 @@ func (p *V2KPool) bgLoop() {
 			return
 		}
 	}
+	p.releaseAll()
 }
 
 func (p *V2KPool) V2K(val interface{}) (interface{}, error) {
@@ -138,6 +139,8 @@ func (p *V2KPool) RemoveVal(val interface{}) {
 }
 
 func (p *V2KPool) Quit() {
-	p.od <- opWithData{exit, nil}
+	// p.od <- opWithData{exit, nil}
+	close(p.od)
+	close(p.res)
 }
 

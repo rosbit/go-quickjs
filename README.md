@@ -35,7 +35,7 @@ func main() {
     fmt.Printf("%v\n", err)
     return
   }
-  defer ctx.Free()
+  defer ctx.Free() // not necessary, ctx will be released by GC.
 
   res, _ := ctx.Eval("a + b", map[string]interface{}{
      "a": 10,

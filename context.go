@@ -9,14 +9,16 @@ import (
 	"unsafe"
 	"os"
 	"fmt"
-	// "runtime"
+	"time"
+	"runtime"
 )
 
 const noname = ""
 
-type (
-	JsContext C.JSContext
-)
+type JsContext struct {
+	c *C.JSContext
+	funcKeyGenerator *V2KPool
+}
 
 func NewContext() (*JsContext, error) {
 	rt := C.JS_NewRuntime()
@@ -30,9 +32,18 @@ func NewContext() (*JsContext, error) {
 	}
 	loadPreludeModules(ctx)
 	C.JS_SetContextOpaque(ctx, unsafe.Pointer(rt))
-	c := (*JsContext)(ctx)
-	// runtime.SetFinalizer(ctx, freeContext)
+	c := &JsContext {
+		c: ctx,
+		funcKeyGenerator: NewV2KPool(func(fnVarPtr interface{}) (interface{}, error) {
+			return int16(time.Now().UnixNano()), nil
+		}, true),
+	}
+	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
+}
+
+func freeJsContext(c *JsContext) {
+	c.Free()
 }
 
 func freeContext(ctx *C.JSContext) {
@@ -45,7 +56,8 @@ func freeContext(ctx *C.JSContext) {
 
 func (ctx *JsContext) Free() {
 	// fmt.Printf("context freed\n")
-	c := (*C.JSContext)(ctx)
+	ctx.funcKeyGenerator.Quit()
+	c := ctx.c
 	freeContext(c)
 }
 
@@ -87,7 +99,7 @@ func (ctx *JsContext) eval(script string, filename string, env map[string]interf
 	scriptFileCstr := C.CString(filename)
 	defer C.free(unsafe.Pointer(scriptFileCstr))
 
-	c := (*C.JSContext)(ctx)
+	c := ctx.c
 	jsVal := C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, C.int(0))
 	res, err = fromJsValue(c, jsVal)
 	C.JS_FreeValue(c, jsVal)
@@ -96,11 +108,11 @@ func (ctx *JsContext) eval(script string, filename string, env map[string]interf
 
 
 func (ctx *JsContext) setEnv(env map[string]interface{}) error {
-	c := (*C.JSContext)(ctx)
+	c := ctx.c
 	global := C.JS_GetGlobalObject(c)
 	for k, _ := range env {
 		v := env[k]
-		jsVal, err := makeJsValue(c, v)
+		jsVal, err := makeJsValue(ctx, v)
 		if err != nil {
 			return err
 		}
@@ -124,7 +136,7 @@ func getVar(c *C.JSContext, global C.JSValue, name string) (v C.JSValue, err err
 }
 
 func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
-	c := (*C.JSContext)(ctx)
+	c := ctx.c
 	global := C.JS_GetGlobalObject(c)
 	defer C.JS_FreeValue(c, global)
 
@@ -153,7 +165,7 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 		return
 	}
 
-	c := (*C.JSContext)(ctx)
+	c := ctx.c
 	global := C.JS_GetGlobalObject(c)
 	defer C.JS_FreeValue(c, global)
 

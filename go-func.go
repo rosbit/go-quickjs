@@ -14,19 +14,9 @@ import (
 	"unsafe"
 	"fmt"
 	"strings"
-	"time"
 )
 
-var (
-	funcKeyGenerator *V2KPool
-)
-func init() {
-	funcKeyGenerator = NewV2KPool(func(fnVarPtr interface{}) (interface{}, error){
-		return int16(time.Now().UnixNano()), nil
-	}, true)
-}
-
-func bindGoFunc(ctx *C.JSContext, name string, funcVar interface{}) (goFunc goFunction, err error) {
+func bindGoFunc(ctx *JsContext, name string, funcVar interface{}) (goFunc goFunction, err error) {
 	t := reflect.TypeOf(funcVar)
 	if t.Kind() != reflect.Func {
 		err = fmt.Errorf("funcVar expected to be a func")
@@ -53,8 +43,9 @@ func bindGoFunc(ctx *C.JSContext, name string, funcVar interface{}) (goFunc goFu
 //export goFuncBridge
 func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C.JSValueConst, magic C.int, func_data *C.JSValue) C.JSValue {
 	// get function pointer from magic
+	c := (*JsContext)(unsafe.Pointer(func_data))
 	key := int16(magic)
-	fnP := funcKeyGenerator.GetVal(key)
+	fnP := c.funcKeyGenerator.GetVal(key)
 	fn := *(fnP.(*interface{}))
 
 	fnVal := reflect.ValueOf(fn)
@@ -114,7 +105,7 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	}
 
 	if retc == 1 {
-		jsVal, err := makeJsValue(ctx, res[0].Interface())
+		jsVal, err := makeJsValue(c, res[0].Interface())
 		if err != nil {
 			emsg := jsString(err.Error()).Value(ctx)
 			return C.JS_Throw(ctx, emsg)
@@ -124,7 +115,7 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 
 	ja := C.JS_NewArray(ctx)
 	for i:=0; i<retc; i++ {
-		jsVal, err := makeJsValue(ctx, res[i].Interface())
+		jsVal, err := makeJsValue(c, res[i].Interface())
 		if err != nil {
 			C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
 		} else {
@@ -134,16 +125,17 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	return ja
 }
 
-func wrapGoFunc(ctx *C.JSContext, name string, fnVar interface{}, fnType reflect.Type) goFunction {
+func wrapGoFunc(c *JsContext, name string, fnVar interface{}, fnType reflect.Type) goFunction {
+	ctx := c.c
 	// convert pointer of function as argumen magic of JS_NewCFunctionData
 	fnVarPtr := &fnVar
-	funcKeyGenerator.RemoveVal(fnVarPtr)
-	fnPtrKey, _ := funcKeyGenerator.V2K(fnVarPtr) // to make function pointer not memory escape
+	c.funcKeyGenerator.RemoveVal(fnVarPtr)
+	fnPtrKey, _ := c.funcKeyGenerator.V2K(fnVarPtr) // to make function pointer not memory escape
 	magic := fnPtrKey.(int16)
 
 	// create a JS function
 	argc := fnType.NumIn()
-	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(magic), C.int(0), (*C.JSValue)(unsafe.Pointer(nil)))
+	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(magic), C.int(1), (*C.JSValue)(unsafe.Pointer(c)))
 
 	return goFunction(jsVal)
 }

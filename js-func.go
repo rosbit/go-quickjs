@@ -19,14 +19,14 @@ func (ctx *JsContext) bindFunc(jsFunc C.JSValue, funcVarPtr interface{}) {
 
 func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, fnType reflect.Type) func(args []reflect.Value) (results []reflect.Value) {
 	return func(args []reflect.Value) (results []reflect.Value) {
-		c := (*C.JSContext)(ctx)
+		c := ctx.c
 		// make js args
 		var jsArgs []C.JSValue
 		lastNumIn := fnType.NumIn() - 1
 		variadic := fnType.IsVariadic()
 		for i, arg := range args {
 			if i < lastNumIn || !variadic {
-				jsVal, err := makeJsValue(c, arg.Interface())
+				jsVal, err := makeJsValue(ctx, arg.Interface())
 				if err != nil {
 					jsArgs = append(jsArgs, C.JS_UNDEFINED)
 				} else {
@@ -40,7 +40,7 @@ func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, fnType reflect.Type) func(args 
 			}
 			varLen := arg.Len()
 			for j:=0; j<varLen; j++ {
-				jsVal, err := makeJsValue(c, arg.Index(j).Interface())
+				jsVal, err := makeJsValue(ctx, arg.Index(j).Interface())
 				if err != nil {
 					jsArgs = append(jsArgs, C.JS_UNDEFINED)
 				} else {
@@ -128,11 +128,11 @@ func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, fnType reflect.Type) func(args 
 }
 
 func (ctx *JsContext) callFunc(fn C.JSValue, args ...interface{}) (res C.JSValue, err error) {
-	c := (*C.JSContext)(ctx)
+	c := ctx.c
 	l := len(args)
 	jsArgs := make([]C.JSValue, l)
 	for i, arg := range args {
-		jsVal, e := makeJsValue(c, arg)
+		jsVal, e := makeJsValue(ctx, arg)
 		if e != nil {
 			err = e
 			return

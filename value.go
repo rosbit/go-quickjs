@@ -36,7 +36,8 @@ var (
 	_ jsValueI = jsFunction(C.JS_UNDEFINED)
 )
 
-func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
+func makeJsValue(c *JsContext, v interface{}) (C.JSValue, error) {
+	ctx := c.c
 	vv := reflect.ValueOf(v)
 	switch vv.Kind() {
 	case reflect.Bool:
@@ -55,28 +56,28 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 		}
 		fallthrough
 	case reflect.Array:
-		if jsArr, err := newJsArray(ctx, v); err != nil {
+		if jsArr, err := newJsArray(c, v); err != nil {
 			return C.JS_UNDEFINED, err
 		} else {
 			return jsArr.Value(ctx), nil
 		}
 	case reflect.Map, reflect.Struct:
-		if jsObj, err := newJsObject(ctx, v); err != nil {
+		if jsObj, err := newJsObject(c, v); err != nil {
 			return C.JS_UNDEFINED, err
 		} else {
 			return jsObj.Value(ctx), nil
 		}
 	case reflect.Ptr:
 		if vv.Elem().Kind() == reflect.Struct {
-			if jsObj, err := newJsObject(ctx, v); err != nil {
+			if jsObj, err := newJsObject(c, v); err != nil {
 				return C.JS_UNDEFINED, err
 			} else {
 				return jsObj.Value(ctx), nil
 			}
 		}
-		return makeJsValue(ctx, vv.Elem().Interface())
+		return makeJsValue(c, vv.Elem().Interface())
 	case reflect.Func:
-		if goFunc, err := bindGoFunc(ctx, "", v); err != nil {
+		if goFunc, err := bindGoFunc(c, "", v); err != nil {
 			return C.JS_UNDEFINED, err
 		} else {
 			return goFunc.Value(ctx), nil
@@ -203,7 +204,8 @@ func (s jsString) Value(ctx *C.JSContext) C.JSValue {
 
 // jsArray
 type jsArray C.JSValue
-func newJsArray(ctx *C.JSContext, a interface{}) (jsArr jsArray, err error) {
+func newJsArray(c *JsContext, a interface{}) (jsArr jsArray, err error) {
+	ctx := c.c
 	if a == nil {
 		jsArr = jsArray(C.JS_UNDEFINED)
 		return
@@ -215,7 +217,7 @@ func newJsArray(ctx *C.JSContext, a interface{}) (jsArr jsArray, err error) {
 		l := v.Len()
 		for i:=0; i<l; i++ {
 			e := v.Index(i).Interface()
-			ev, err := makeJsValue(ctx, e)
+			ev, err := makeJsValue(c, e)
 			if err != nil {
 				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
 			} else {
@@ -225,7 +227,7 @@ func newJsArray(ctx *C.JSContext, a interface{}) (jsArr jsArray, err error) {
 		jsArr = jsArray(ja)
 		return
 	case reflect.Ptr:
-		return newJsArray(ctx, v.Elem().Interface())
+		return newJsArray(c, v.Elem().Interface())
 	default:
 		err = fmt.Errorf("slice or array expected")
 		return
@@ -276,7 +278,8 @@ func (a jsArray) Value(ctx *C.JSContext) C.JSValue {
 
 // jsObject
 type jsObject C.JSValue
-func newJsObject(ctx *C.JSContext, o interface{}) (jsObj jsObject, err error) {
+func newJsObject(c *JsContext, o interface{}) (jsObj jsObject, err error) {
+	ctx := c.c
 	if o == nil {
 		jsObj = jsObject(C.JS_UNDEFINED)
 		return
@@ -291,7 +294,7 @@ func newJsObject(ctx *C.JSContext, o interface{}) (jsObj jsObject, err error) {
 			v := mr.Value()
 
 			cstr := C.CString(k.String())
-			ev, err := makeJsValue(ctx, v.Interface())
+			ev, err := makeJsValue(c, v.Interface())
 			if err != nil {
 				C.JS_SetPropertyStr(ctx, jo, cstr, C.JS_NULL)
 			} else {
@@ -302,13 +305,13 @@ func newJsObject(ctx *C.JSContext, o interface{}) (jsObj jsObject, err error) {
 		jsObj = jsObject(jo)
 		return
 	case reflect.Struct:
-		return struct2Object(ctx, v)
+		return struct2Object(c, v)
 	case reflect.Ptr:
 		ev := v.Elem()
 		if ev.Kind() == reflect.Struct {
-			return struct2Object(ctx, v)
+			return struct2Object(c, v)
 		}
-		return newJsObject(ctx, ev.Interface())
+		return newJsObject(c, ev.Interface())
 	default:
 		err = fmt.Errorf("map expected")
 		return
@@ -354,7 +357,7 @@ func (o jsObject) Value(ctx *C.JSContext) C.JSValue {
 }
 
 // struct
-func struct2Object(ctx *C.JSContext, structVar reflect.Value) (jsObj jsObject, err error) {
+func struct2Object(ctx *JsContext, structVar reflect.Value) (jsObj jsObject, err error) {
 	var structE reflect.Value
 	if structVar.Kind() == reflect.Ptr {
 		structE = structVar.Elem()
@@ -372,7 +375,7 @@ func struct2Object(ctx *C.JSContext, structVar reflect.Value) (jsObj jsObject, e
 		structE = structVar.Elem()       // structE is the copied struct
 	}*/
 
-	jo := C.JS_NewObject(ctx)
+	jo := C.JS_NewObject(ctx.c)
 	if err = makeStructFields(ctx, jo, structE, structT); err != nil {
 		return
 	}
@@ -387,12 +390,13 @@ func upperFirst(name string) string {
 	return strings.ToUpper(name[:1]) + name[1:]
 }
 
-func makeStructFields(ctx *C.JSContext, jo C.JSValue, structE reflect.Value, structT reflect.Type) (err error) {
+func makeStructFields(c *JsContext, jo C.JSValue, structE reflect.Value, structT reflect.Type) (err error) {
+	ctx := c.c
 	for i:=0; i<structT.NumField(); i++ {
 		name := structT.Field(i).Name
 		fv := structE.FieldByName(name)
 		cstr := C.CString(lowerFirst(name))
-		ev, err := makeJsValue(ctx, fv.Interface())
+		ev, err := makeJsValue(c, fv.Interface())
 		if err != nil {
 			C.JS_SetPropertyStr(ctx, jo, cstr, C.JS_NULL)
 		} else {
