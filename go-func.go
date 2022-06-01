@@ -14,10 +14,19 @@ import (
 	"unsafe"
 	"fmt"
 	"strings"
-	"strconv"
+	"time"
 )
 
-func bindGoFunc(ctx *C.JSContext, name string, funcVar interface{}) (goFunc *goFunction, err error) {
+var (
+	funcKeyGenerator *V2KPool
+)
+func init() {
+	funcKeyGenerator = NewV2KPool(func(fnVarPtr interface{}) (interface{}, error){
+		return int16(time.Now().UnixNano()), nil
+	}, true)
+}
+
+func bindGoFunc(ctx *C.JSContext, name string, funcVar interface{}) (goFunc goFunction, err error) {
 	t := reflect.TypeOf(funcVar)
 	if t.Kind() != reflect.Func {
 		err = fmt.Errorf("funcVar expected to be a func")
@@ -43,15 +52,10 @@ func bindGoFunc(ctx *C.JSContext, name string, funcVar interface{}) (goFunc *goF
 
 //export goFuncBridge
 func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C.JSValueConst, magic C.int, func_data *C.JSValue) C.JSValue {
-	// get function pointer from data
-	jsFnPtr := *func_data
-	cFnPtr := C.JS_ToCString(ctx, jsFnPtr)
-	fnPtr := C.GoString(cFnPtr)
-	fnP, err := strconv.ParseUint(fnPtr, 10, 64)
-	if err != nil {
-		return C.JS_UNDEFINED
-	}
-	fn := *(*interface{})(unsafe.Pointer(uintptr(fnP)))
+	// get function pointer from magic
+	key := int16(magic)
+	fnP := funcKeyGenerator.GetVal(key)
+	fn := *(fnP.(*interface{}))
 
 	fnVal := reflect.ValueOf(fn)
 	fnType := fnVal.Type()
@@ -130,23 +134,17 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	return ja
 }
 
-func wrapGoFunc(ctx *C.JSContext, name string, fnVar interface{}, fnType reflect.Type) *goFunction {
-	// convert pointer of function as data argument of JS_NewCFunctionData
-	fnPtr := fmt.Sprintf("%d", uint64(uintptr(unsafe.Pointer(&fnVar))))
-	cFnPtr := C.CString(fnPtr)
-	jsFnPtr := C.JS_NewString(ctx, cFnPtr)
-	C.free(unsafe.Pointer(cFnPtr))
+func wrapGoFunc(ctx *C.JSContext, name string, fnVar interface{}, fnType reflect.Type) goFunction {
+	// convert pointer of function as argumen magic of JS_NewCFunctionData
+	fnVarPtr := &fnVar
+	funcKeyGenerator.RemoveVal(fnVarPtr)
+	fnPtrKey, _ := funcKeyGenerator.V2K(fnVarPtr) // to make function pointer not memory escape
+	magic := fnPtrKey.(int16)
 
 	// create a JS function
 	argc := fnType.NumIn()
-	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(0), C.int(1), &jsFnPtr)
-	C.JS_FreeValue(ctx, jsFnPtr)
+	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(magic), C.int(0), (*C.JSValue)(unsafe.Pointer(nil)))
 
-	// save function pointer to make it not escape
-	goFunc := &goFunction{
-		jsValue: jsVal,
-		fnVar: &fnVar,
-	}
-	return goFunc
+	return goFunction(jsVal)
 }
 

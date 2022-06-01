@@ -32,7 +32,7 @@ var (
 	_ jsValueI = jsString("")
 	_ jsValueI = jsArray(C.JS_UNDEFINED)
 	_ jsValueI = jsObject(C.JS_UNDEFINED)
-	_ jsValueI = (*goFunction)(nil)
+	_ jsValueI = goFunction(C.JS_UNDEFINED)
 	_ jsValueI = jsFunction(C.JS_UNDEFINED)
 )
 
@@ -404,15 +404,9 @@ func makeStructFields(ctx *C.JSContext, jo C.JSValue, structE reflect.Value, str
 }
 
 // function
-type goFunction struct {
-	jsValue C.JSValue
-	fnVar *interface{}
-}
-func (f *goFunction) Value(ctx *C.JSContext) C.JSValue {
-	if f.fnVar != nil {
-		return f.jsValue
-	}
-	return C.JS_UNDEFINED
+type goFunction C.JSValue
+func (f goFunction) Value(ctx *C.JSContext) C.JSValue {
+	return C.JSValue(f)
 }
 
 // jsFunction
