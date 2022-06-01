@@ -80,12 +80,20 @@ func main() {
      return
   }
 
+  // method 1: bind JS function with a golang var
   if err := ctx.BindFunc("add", &add); err != nil {
      fmt.Printf("%v\n", err)
      return
   }
-
   res := add(1, 2)
+
+  // method 2: call JS function using Call
+  res, err := ctx.CallFunc("add", 1, 2)
+  if err != nil {
+     fmt.Printf("%v\n", err)
+     return
+  }
+
   fmt.Println("result is:", res)
 }
 ```

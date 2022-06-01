@@ -151,6 +151,31 @@ func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 	return
 }
 
+func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interface{}, err error) {
+	c := ctx.c
+	global := C.JS_GetGlobalObject(c)
+	defer C.JS_FreeValue(c, global)
+
+	v, e := getVar(c, global, funcName)
+	if e != nil {
+		err = e
+		return
+	}
+	defer C.JS_FreeValue(c, v)
+	if C.JS_IsFunction(c, v) == 0 {
+		err = fmt.Errorf("var %s is not with type function", funcName)
+		return
+	}
+
+	r, e := ctx.callFunc(v, args...)
+	if e != nil {
+		err = e
+		return
+	}
+	res, err = fromJsValue(c, r)
+	return
+}
+
 // bind a var of golang func with a JS function name, so calling JS function
 // is just calling the related golang func.
 // @param funcVarPtr  in format `var funcVar func(....) ...; funcVarPtr = &funcVar`
