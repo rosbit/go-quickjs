@@ -5,47 +5,34 @@ package quickjs
 */
 import "C"
 import (
+	elutils "github.com/rosbit/go-embedding-utils"
 	"reflect"
-	"fmt"
 	"unsafe"
 )
 
-func (ctx *JsContext) bindFunc(jsFunc C.JSValue, funcVarPtr interface{}) {
-	dest := reflect.ValueOf(funcVarPtr).Elem()
-	fnType := dest.Type()
-	dest.Set(reflect.Zero(fnType))
-	dest.Set(reflect.MakeFunc(fnType, ctx.wrapFunc(jsFunc, fnType)))
+func (ctx *JsContext) bindFunc(jsFunc C.JSValue, funcVarPtr interface{}) (err error) {
+	helper, e := elutils.NewEmbeddingFuncHelper(funcVarPtr)
+	if e != nil {
+		err = e
+		return
+	}
+	helper.BindEmbeddingFunc(ctx.wrapFunc(jsFunc, helper))
+	return
 }
 
-func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, fnType reflect.Type) func(args []reflect.Value) (results []reflect.Value) {
+func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, helper *elutils.EmbeddingFuncHelper) elutils.FnGoFunc {
 	return func(args []reflect.Value) (results []reflect.Value) {
 		c := ctx.c
-		// make js args
 		var jsArgs []C.JSValue
-		lastNumIn := fnType.NumIn() - 1
-		variadic := fnType.IsVariadic()
-		for i, arg := range args {
-			if i < lastNumIn || !variadic {
-				jsVal, err := makeJsValue(ctx, arg.Interface())
-				if err != nil {
-					jsArgs = append(jsArgs, C.JS_UNDEFINED)
-				} else {
-					jsArgs = append(jsArgs, jsVal)
-				}
-				continue
-			}
 
-			if arg.IsZero() {
-				break
-			}
-			varLen := arg.Len()
-			for j:=0; j<varLen; j++ {
-				jsVal, err := makeJsValue(ctx, arg.Index(j).Interface())
-				if err != nil {
-					jsArgs = append(jsArgs, C.JS_UNDEFINED)
-				} else {
-					jsArgs = append(jsArgs, jsVal)
-				}
+		// make js args
+		itArgs := helper.MakeGoFuncArgs(args)
+		for arg := range itArgs {
+			jsVal, err := makeJsValue(ctx, arg)
+			if err != nil {
+				jsArgs = append(jsArgs, C.JS_UNDEFINED)
+			} else {
+				jsArgs = append(jsArgs, jsVal)
 			}
 		}
 
@@ -61,68 +48,9 @@ func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, fnType reflect.Type) func(args 
 		}
 
 		// convert result to golang
-		results = make([]reflect.Value, fnType.NumOut())
-		var err error
-		if jsRes == C.JS_EXCEPTION {
-			exVal := exception.Value(c)
-			goExVal, e := fromJsValue(c, exVal)
-			C.JS_FreeValue(c, exVal)
-			if e != nil {
-				err = e
-			} else {
-				err = fmt.Errorf("excpetion occured: %v", goExVal)
-			}
-		} else {
-			if fnType.NumOut() > 0 {
-				if C.JS_IsArray(c, jsRes) != 0 {
-					goVal, e := fromJsArray(c, jsRes)
-					if e != nil {
-						err = e
-					} else {
-						mRes := goVal.([]interface{})
-						l := len(mRes)
-						n := fnType.NumOut()
-						if n < l {
-							l = n
-						}
-						for i:=0; i<l; i++ {
-							v := makeValue(fnType.Out(i))
-							rv := mRes[i]
-							if err = setValue(v, rv); err == nil {
-								results[i] = v
-							}
-						}
-					}
-				} else {
-					v := makeValue(fnType.Out(0))
-					rv, e := fromJsValue(c, jsRes)
-					if e != nil {
-						err = e
-					} else {
-						if err = setValue(v, rv); err == nil {
-							results[0] = v
-						}
-					}
-				}
-			}
-			C.JS_FreeValue(c, jsRes)
-		}
-
-		if err != nil {
-			nOut := fnType.NumOut()
-			if nOut > 0 && fnType.Out(nOut-1).Name() == "error" {
-				results[nOut-1] = reflect.ValueOf(err).Convert(fnType.Out(nOut-1))
-			} else {
-				panic(err)
-			}
-		}
-
-		for i, v := range results {
-			if !v.IsValid() {
-				results[i] = reflect.Zero(fnType.Out(i))
-			}
-		}
-
+		goVal, err := fromJsValue(c, jsRes)
+		results = helper.ToGolangResults(goVal, C.JS_IsArray(c, jsRes) != 0, err)
+		C.JS_FreeValue(c, jsRes)
 		return
 	}
 }

@@ -9,6 +9,7 @@ extern JSValue goFuncBridge(JSContext *ctx, JSValueConst this_val, int argc, JSV
 */
 import "C"
 import (
+	elutils "github.com/rosbit/go-embedding-utils"
 	"reflect"
 	"runtime"
 	"unsafe"
@@ -51,78 +52,43 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	fnVal := reflect.ValueOf(fn)
 	fnType := fnVal.Type()
 
-	// get arguments of js calling，construct go function args
-	argsNum := int(argc)
-	variadic := fnType.IsVariadic()
-	lastNumIn := fnType.NumIn() - 1
-	if variadic {
-		if argsNum < lastNumIn {
-			msg := fmt.Sprintf("at least %d args to call", lastNumIn)
-			emsg := jsString(msg).Value(ctx)
-			return C.JS_Throw(ctx, emsg)
-		} else {
-			if argsNum != fnType.NumIn() {
-				msg := fmt.Sprintf("%d args expected to call", argsNum)
-				emsg := jsString(msg).Value(ctx)
-				return C.JS_Throw(ctx, emsg)
-			}
-		}
-	}
-	goArgs := make([]reflect.Value, argsNum)
-	var fnArgType reflect.Type
-	for i:=0; i<argsNum; i++ {
-		if i<lastNumIn || !variadic {
-			fnArgType = fnType.In(i)
-		} else {
-			fnArgType = fnType.In(lastNumIn).Elem()
-		}
-		goArgs[i] = makeValue(fnArgType)
+	helper := elutils.NewGolangFuncHelperDiretly(fnVal, fnType)
+	getArgs := func(i int) interface{} {
 		jsArg := C.getArg(argv, C.int(i))
 		if goVal, err := fromJsValue(ctx, jsArg); err == nil {
-			setValue(goArgs[i], goVal)
+			return goVal
 		}
+		return nil
+	}
+	v, e := helper.CallGolangFunc(int(argc), "qjs-func", getArgs)
+	if e != nil {
+		emsg := jsString(e.Error()).Value(ctx)
+		return C.JS_Throw(ctx, emsg)
 	}
 
-	// calling go function
-	res := fnVal.Call(goArgs)
-
-	// convert result to JSValue
-	retc := len(res)
-	if retc == 0 {
+	if v == nil {
 		return C.JS_UNDEFINED
 	}
-	lastRetType := fnType.Out(retc-1)
-	if lastRetType.Name() == "error" {
-		e := res[retc-1].Interface()
-		if e != nil {
-			emsg := jsString(e.(error).Error()).Value(ctx)
-			return C.JS_Throw(ctx, emsg)
-		}
-		retc -= 1
-		if retc == 0 {
-			return C.JS_UNDEFINED
-		}
-	}
 
-	if retc == 1 {
-		jsVal, err := makeJsValue(c, res[0].Interface())
+	if vv, ok := v.([]interface{}); ok {
+		ja := C.JS_NewArray(ctx)
+		for i, rv := range vv {
+			jsVal, err := makeJsValue(c, rv)
+			if err != nil {
+				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
+			} else {
+				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), jsVal)
+			}
+		}
+		return ja
+	} else {
+		jsVal, err := makeJsValue(c, v)
 		if err != nil {
 			emsg := jsString(err.Error()).Value(ctx)
 			return C.JS_Throw(ctx, emsg)
 		}
 		return jsVal
 	}
-
-	ja := C.JS_NewArray(ctx)
-	for i:=0; i<retc; i++ {
-		jsVal, err := makeJsValue(c, res[i].Interface())
-		if err != nil {
-			C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
-		} else {
-			C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), jsVal)
-		}
-	}
-	return ja
 }
 
 func wrapGoFunc(c *JsContext, name string, fnVar interface{}, fnType reflect.Type) goFunction {
