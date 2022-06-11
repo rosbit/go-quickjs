@@ -2,7 +2,7 @@
 
 [QuickJS](https://bellard.org/quickjs/) is a small and embeddable Javascript engine written by [Fabrice Bellard](https://bellard.org).
 
-`go-quickjs` is a package wrapping quickjs and making it a **pragmatic embedding** language.
+`go-quickjs` is a package wrapping quickjs and making it a **pragmatic embeddable** language.
 With some helper functions provided by `go-quickjs`, calling Golang functions from Javascript, 
 or calling Javascript functions from Golang are both very simple. So, with the help of `go-quickjs`, quickjs
 can be embedded in Golang application easily.
