@@ -1,8 +1,6 @@
 package quickjs
 
 /*
-#cgo CFLAGS: -I.
-#cgo LDFLAGS: -L. -lquickjs -lm
 #include "quickjs-libc.h"
 static JSAtom getAtom(struct JSPropertyEnum *atom, int i) {
 	return atom[i].atom;

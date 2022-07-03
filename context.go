@@ -7,7 +7,6 @@ import "C"
 import (
 	"reflect"
 	"unsafe"
-	"os"
 	"fmt"
 	"runtime"
 )
@@ -16,7 +15,7 @@ const noname = ""
 
 type JsContext struct {
 	c *C.JSContext
-	funcKeyGenerator *V2KPool
+	valCache *V2KPool
 	global C.JSValue
 }
 
@@ -33,29 +32,25 @@ func NewContext() (*JsContext, error) {
 	loadPreludeModules(ctx)
 	c := &JsContext {
 		c: ctx,
-		funcKeyGenerator: NewV2KPool(),
+		valCache: NewV2KPool(),
 		global: C.JS_GetGlobalObject(ctx),
 	}
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
 }
 
-func freeJsContext(c *JsContext) {
-	c.Free()
+func freeJsContext(ctx *JsContext) {
+	// fmt.Printf("context freed\n")
+	ctx.valCache.Quit()
+	c := ctx.c
+	C.JS_FreeValue(c, ctx.global)
+	freeContext(c)
 }
 
 func freeContext(ctx *C.JSContext) {
 	rt := C.JS_GetRuntime(ctx)
 	C.JS_FreeContext(ctx)
 	C.JS_FreeRuntime(rt)
-}
-
-func (ctx *JsContext) Free() {
-	// fmt.Printf("context freed\n")
-	ctx.funcKeyGenerator.Quit()
-	c := ctx.c
-	C.JS_FreeValue(c, ctx.global)
-	freeContext(c)
 }
 
 func loadPreludeModules(ctx *C.JSContext) {
@@ -73,25 +68,32 @@ func loadPreludeModules(ctx *C.JSContext) {
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
-	return ctx.eval(script, noname, env)
-}
-
-func (ctx *JsContext) EvalFile(scriptFile string, env map[string]interface{}) (res interface{}, err error) {
-	script, e := os.ReadFile(scriptFile)
-	if e != nil {
-		err = e
-		return
-	}
-	return ctx.eval(string(script), scriptFile, env)
-}
-
-func (ctx *JsContext) eval(script string, filename string, env map[string]interface{}) (res interface{}, err error) {
-	if err = ctx.setEnv(env); err != nil {
-		return
-	}
 	scriptCstr := C.CString(script)
 	defer C.free(unsafe.Pointer(scriptCstr))
 	scriptClen := C.size_t(len(script))
+
+	return ctx.eval(scriptCstr, scriptClen, noname, env)
+}
+
+func (ctx *JsContext) EvalFile(scriptFile string, env map[string]interface{}) (res interface{}, err error) {
+	var scriptClen C.size_t
+
+	scriptFileCstr := C.CString(scriptFile)
+	defer C.free(unsafe.Pointer(scriptFileCstr))
+	script := C.js_load_file(ctx.c, &scriptClen, scriptFileCstr)
+	if script == (*C.uint8_t)(unsafe.Pointer(nil)) {
+		err = fmt.Errorf("failed to load %s", scriptFile)
+		return
+	}
+	defer C.js_free(ctx.c, unsafe.Pointer(script))
+
+	return ctx.eval((*C.char)(unsafe.Pointer(script)), scriptClen, scriptFile, env)
+}
+
+func (ctx *JsContext) eval(scriptCstr *C.char, scriptClen C.size_t, filename string, env map[string]interface{}) (res interface{}, err error) {
+	if err = ctx.setEnv(env); err != nil {
+		return
+	}
 
 	scriptFileCstr := C.CString(filename)
 	defer C.free(unsafe.Pointer(scriptFileCstr))

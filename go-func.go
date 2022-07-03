@@ -26,14 +26,7 @@ func genGoFuncMagic() int16 {
 type wrappedGoFunc struct {
 	c *C.JSContext
 	fnVarPtr *interface{}
-	// jsVal C.JSValue
 }
-
-/*
-func freeGoFunc(key, val interface{}) {
-	wgf := val.(*wrappedGoFunc)
-	C.JS_FreeValue(wgf.c, wgf.jsVal)
-}*/
 
 func bindGoFunc(ctx *JsContext, name string, funcVar interface{}) (goFunc goFunction, err error) {
 	t := reflect.TypeOf(funcVar)
@@ -65,18 +58,16 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	cCtx := C.JS_ToCString(ctx, *func_data)
 	sCtxPtr := C.GoString(cCtx)
 	C.JS_FreeCString(ctx, cCtx)
-	ctxPtr, err := strconv.ParseUint(sCtxPtr[2:], 16, 64)
+	ctxPtr, err := strconv.ParseUint(sCtxPtr, 16, 64)
 	if err != nil {
 		return C.JS_UNDEFINED
 	}
 	c := (*JsContext)(unsafe.Pointer(uintptr(ctxPtr)))
 
 	key := int16(magic)
-	wgf := c.funcKeyGenerator.GetVal(key)
+	wgf := c.valCache.GetVal(key)
 	gf := wgf.(*wrappedGoFunc)
 	fn := *(gf.fnVarPtr)
-	// fnP := c.funcKeyGenerator.GetVal(key)
-	// fn := *(fnP.(*interface{}))
 
 	fnVal := reflect.ValueOf(fn)
 	fnType := fnVal.Type()
@@ -129,10 +120,10 @@ func wrapGoFunc(c *JsContext, name string, fnVar interface{}, fnType reflect.Typ
 		c: ctx,
 		fnVarPtr: &fnVar,
 	}
-	c.funcKeyGenerator.SetKV(magic, wgf, nil) // to make function pointer not memory escape
+	c.valCache.SetKV(magic, wgf, nil) // to make function pointer not memory escape
 
 	sCtxPtr := fmt.Sprintf("%p", c)
-	cCtx := C.CString(sCtxPtr)
+	cCtx := C.CString(sCtxPtr[2:])
 	jsCtx := C.JS_NewString(ctx, cCtx)
 	C.free(unsafe.Pointer(cCtx))
 	defer C.JS_FreeValue(ctx, jsCtx)

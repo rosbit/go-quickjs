@@ -9,13 +9,11 @@ can be embedded in Golang application easily.
 
 ### Install
 
-To install go-quickjs, following the steps (under Linux/macos):
+The package is fully go-getable, So, just type
 
-1. make sure `gcc`, `make`, `wget` are ready
-2. run `git clone github.com/rosbit/go-quickjs` to clone the source
-3. `cd go-quickjs` to change the directory
-4. run `make` to build the `libquickjs.a`
-5. optionally run `go build`.
+  `go get github.com/rosbit/go-quickjs`
+
+to install.
 
 ### Usage
 
@@ -35,7 +33,6 @@ func main() {
     fmt.Printf("%v\n", err)
     return
   }
-  defer ctx.Free() // not necessary, ctx will be released by GC.
 
   res, _ := ctx.Eval("a + b", map[string]interface{}{
      "a": 10,
@@ -73,7 +70,6 @@ func main() {
      fmt.Printf("%v\n", err)
      return
   }
-  defer ctx.Free()
 
   if _, err := ctx.EvalFile("a.js", nil); err != nil {
      fmt.Printf("%v\n", err)
@@ -119,7 +115,6 @@ func main() {
       fmt.Printf("%v\n", err)
       return
   }
-  defer ctx.Free()
 
   if _, err := ctx.EvalFile("b.js", map[string]interface{}{
       "adder": adder,
