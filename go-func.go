@@ -14,8 +14,26 @@ import (
 	"runtime"
 	"unsafe"
 	"fmt"
+	"time"
+	"strconv"
 	"strings"
 )
+
+func genGoFuncMagic() int16 {
+	return int16(time.Now().UnixNano())
+}
+
+type wrappedGoFunc struct {
+	c *C.JSContext
+	fnVarPtr *interface{}
+	// jsVal C.JSValue
+}
+
+/*
+func freeGoFunc(key, val interface{}) {
+	wgf := val.(*wrappedGoFunc)
+	C.JS_FreeValue(wgf.c, wgf.jsVal)
+}*/
 
 func bindGoFunc(ctx *JsContext, name string, funcVar interface{}) (goFunc goFunction, err error) {
 	t := reflect.TypeOf(funcVar)
@@ -44,10 +62,21 @@ func bindGoFunc(ctx *JsContext, name string, funcVar interface{}) (goFunc goFunc
 //export goFuncBridge
 func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C.JSValueConst, magic C.int, func_data *C.JSValue) C.JSValue {
 	// get function pointer from magic
-	c := (*JsContext)(unsafe.Pointer(func_data))
+	cCtx := C.JS_ToCString(ctx, *func_data)
+	sCtxPtr := C.GoString(cCtx)
+	C.JS_FreeCString(ctx, cCtx)
+	ctxPtr, err := strconv.ParseUint(sCtxPtr[2:], 16, 64)
+	if err != nil {
+		return C.JS_UNDEFINED
+	}
+	c := (*JsContext)(unsafe.Pointer(uintptr(ctxPtr)))
+
 	key := int16(magic)
-	fnP := c.funcKeyGenerator.GetVal(key)
-	fn := *(fnP.(*interface{}))
+	wgf := c.funcKeyGenerator.GetVal(key)
+	gf := wgf.(*wrappedGoFunc)
+	fn := *(gf.fnVarPtr)
+	// fnP := c.funcKeyGenerator.GetVal(key)
+	// fn := *(fnP.(*interface{}))
 
 	fnVal := reflect.ValueOf(fn)
 	fnType := fnVal.Type()
@@ -94,14 +123,23 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 func wrapGoFunc(c *JsContext, name string, fnVar interface{}, fnType reflect.Type) goFunction {
 	ctx := c.c
 	// convert pointer of function as argumen magic of JS_NewCFunctionData
-	fnVarPtr := &fnVar
-	c.funcKeyGenerator.RemoveVal(fnVarPtr)
-	fnPtrKey, _ := c.funcKeyGenerator.V2K(fnVarPtr) // to make function pointer not memory escape
-	magic := fnPtrKey.(int16)
+	magic := genGoFuncMagic()
+
+	wgf := &wrappedGoFunc{
+		c: ctx,
+		fnVarPtr: &fnVar,
+	}
+	c.funcKeyGenerator.SetKV(magic, wgf, nil) // to make function pointer not memory escape
+
+	sCtxPtr := fmt.Sprintf("%p", c)
+	cCtx := C.CString(sCtxPtr)
+	jsCtx := C.JS_NewString(ctx, cCtx)
+	C.free(unsafe.Pointer(cCtx))
+	defer C.JS_FreeValue(ctx, jsCtx)
 
 	// create a JS function
 	argc := fnType.NumIn()
-	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(magic), C.int(1), (*C.JSValue)(unsafe.Pointer(c)))
+	jsVal := C.JS_NewCFunctionData(ctx, (*C.JSCFunctionData)(C.goFuncBridge), C.int(argc), C.int(magic), C.int(1), (*C.JSValue)(unsafe.Pointer(&jsCtx)))
 
 	return goFunction(jsVal)
 }

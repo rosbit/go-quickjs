@@ -11,7 +11,6 @@ static JSAtom getAtom(struct JSPropertyEnum *atom, int i) {
 import "C"
 import (
 	"reflect"
-	// "runtime"
 	"unsafe"
 	"fmt"
 	"strings"
@@ -33,7 +32,6 @@ var (
 	_ jsValueI = jsArray(C.JS_UNDEFINED)
 	_ jsValueI = jsObject(C.JS_UNDEFINED)
 	_ jsValueI = goFunction(C.JS_UNDEFINED)
-	_ jsValueI = jsFunction(C.JS_UNDEFINED)
 )
 
 func makeJsValue(c *JsContext, v interface{}) (C.JSValue, error) {
@@ -89,7 +87,7 @@ func makeJsValue(c *JsContext, v interface{}) (C.JSValue, error) {
 
 func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	switch {
-	case jsVal == C.JS_EXCEPTION:
+	case C.JS_IsException(jsVal) != 0:
 		exVal := exception.Value(ctx)
 		goVal, err = fromJsValue(ctx, exVal)
 		C.JS_FreeValue(ctx, exVal)
@@ -250,7 +248,7 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	}
 	for i:=0; i<l; i++ {
 		eJsV := C.JS_GetPropertyUint32(ctx, jsVal, C.uint32_t(i))
-		if eJsV == C.JS_EXCEPTION {
+		if C.JS_IsException(eJsV) != 0 {
 			exVal := exception.Value(ctx)
 			goExVal, e := fromJsValue(ctx, exVal)
 			C.JS_FreeValue(ctx, exVal)
@@ -418,7 +416,4 @@ type jsFunction C.JSValue
 func createJsFunc(ctx *C.JSContext, jsVal C.JSValue) (jsFunc jsFunction, err error) {
 	jsFunc = jsFunction(jsVal)
 	return
-}
-func (jsFunc jsFunction) Value(ctx *C.JSContext) C.JSValue {
-	return C.JSValue(jsFunc)
 }

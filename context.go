@@ -9,7 +9,6 @@ import (
 	"unsafe"
 	"os"
 	"fmt"
-	"time"
 	"runtime"
 )
 
@@ -18,6 +17,7 @@ const noname = ""
 type JsContext struct {
 	c *C.JSContext
 	funcKeyGenerator *V2KPool
+	global C.JSValue
 }
 
 func NewContext() (*JsContext, error) {
@@ -31,12 +31,10 @@ func NewContext() (*JsContext, error) {
 		return nil, fmt.Errorf("failed to create context")
 	}
 	loadPreludeModules(ctx)
-	C.JS_SetContextOpaque(ctx, unsafe.Pointer(rt))
 	c := &JsContext {
 		c: ctx,
-		funcKeyGenerator: NewV2KPool(func(fnVarPtr interface{}) (interface{}, error) {
-			return int16(time.Now().UnixNano()), nil
-		}, true),
+		funcKeyGenerator: NewV2KPool(),
+		global: C.JS_GetGlobalObject(ctx),
 	}
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
@@ -47,17 +45,16 @@ func freeJsContext(c *JsContext) {
 }
 
 func freeContext(ctx *C.JSContext) {
-	rt := (*C.JSRuntime)(unsafe.Pointer(C.JS_GetContextOpaque(ctx)))
+	rt := C.JS_GetRuntime(ctx)
 	C.JS_FreeContext(ctx)
-	if rt != nil {
-		C.JS_FreeRuntime(rt)
-	}
+	C.JS_FreeRuntime(rt)
 }
 
 func (ctx *JsContext) Free() {
 	// fmt.Printf("context freed\n")
 	ctx.funcKeyGenerator.Quit()
 	c := ctx.c
+	C.JS_FreeValue(c, ctx.global)
 	freeContext(c)
 }
 
@@ -109,7 +106,6 @@ func (ctx *JsContext) eval(script string, filename string, env map[string]interf
 
 func (ctx *JsContext) setEnv(env map[string]interface{}) error {
 	c := ctx.c
-	global := C.JS_GetGlobalObject(c)
 	for k, _ := range env {
 		v := env[k]
 		jsVal, err := makeJsValue(ctx, v)
@@ -117,10 +113,9 @@ func (ctx *JsContext) setEnv(env map[string]interface{}) error {
 			return err
 		}
 		cstr := C.CString(k)
-		C.JS_SetPropertyStr(c, global, cstr, jsVal)
+		C.JS_SetPropertyStr(c, ctx.global, cstr, jsVal)
 		C.free(unsafe.Pointer(cstr))
 	}
-	C.JS_FreeValue(c, global)
 	return nil
 }
 
@@ -137,10 +132,8 @@ func getVar(c *C.JSContext, global C.JSValue, name string) (v C.JSValue, err err
 
 func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 	c := ctx.c
-	global := C.JS_GetGlobalObject(c)
-	defer C.JS_FreeValue(c, global)
 
-	r, e := getVar(c, global, name)
+	r, e := getVar(c, ctx.global, name)
 	if e != nil {
 		err = e
 		return
@@ -153,10 +146,8 @@ func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 
 func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interface{}, err error) {
 	c := ctx.c
-	global := C.JS_GetGlobalObject(c)
-	defer C.JS_FreeValue(c, global)
 
-	v, e := getVar(c, global, funcName)
+	v, e := getVar(c, ctx.global, funcName)
 	if e != nil {
 		err = e
 		return
@@ -191,10 +182,8 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 	}
 
 	c := ctx.c
-	global := C.JS_GetGlobalObject(c)
-	defer C.JS_FreeValue(c, global)
 
-	v, e := getVar(c, global, funcName)
+	v, e := getVar(c, ctx.global, funcName)
 	if e != nil {
 		err = e
 		return
