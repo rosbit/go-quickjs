@@ -1,1 +1,2 @@
 *.h linguist-language=GoLang
+*.c linguist-language=GoLang
