@@ -391,6 +391,9 @@ func makeStructFields(c *JsContext, jo C.JSValue, structE reflect.Value, structT
 	for i:=0; i<structT.NumField(); i++ {
 		name := structT.Field(i).Name
 		fv := structE.FieldByName(name)
+		if !fv.CanInterface() {
+			continue
+		}
 		cstr := C.CString(lowerFirst(name))
 		ev, err := makeJsValue(c, fv.Interface())
 		if err != nil {
