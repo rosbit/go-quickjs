@@ -31,10 +31,7 @@ func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext
 	jsC, ok := jsCtxCache[path]
 
 	if !ok {
-		if ctx, err = NewContext(); err != nil {
-			return
-		}
-		if _, err = ctx.EvalFile(path, vars); err != nil {
+		if ctx, err = createJSContext(path, vars); err != nil {
 			return
 		}
 		fi, _ := os.Stat(path)
@@ -52,12 +49,24 @@ func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext
 		return
 	}
 	mt := fi.ModTime()
-	if jsC.mt.Before(mt) {
-		if _, err = jsC.jsvm.EvalFile(path, vars); err != nil {
+	if !jsC.mt.Equal(mt) {
+		if ctx, err = createJSContext(path, vars); err != nil {
 			return
 		}
+		jsC.jsvm = ctx
 		jsC.mt = mt
+	} else {
+		ctx = jsC.jsvm
 	}
-	ctx = jsC.jsvm
+	return
+}
+
+func createJSContext(path string, vars map[string]interface{}) (ctx *JsContext, err error) {
+	if ctx, err = NewContext(); err != nil {
+		return
+	}
+	if _, err = ctx.EvalFile(path, vars); err != nil {
+		return
+	}
 	return
 }
