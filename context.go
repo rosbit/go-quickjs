@@ -15,7 +15,7 @@ const noname = ""
 
 type JsContext struct {
 	c *C.JSContext
-	valCache *V2KPool
+	env map[string]interface{}
 	global C.JSValue
 }
 
@@ -32,19 +32,29 @@ func NewContext() (*JsContext, error) {
 	loadPreludeModules(ctx)
 	c := &JsContext {
 		c: ctx,
-		valCache: NewV2KPool(),
 		global: C.JS_GetGlobalObject(ctx),
 	}
+	bindContext(c)
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
 }
 
+func bindContext(ctx *JsContext) {
+	c := ctx.c
+	C.JS_SetContextOpaque(c, unsafe.Pointer(ctx))
+}
+
+func getContext(c *C.JSContext) (*JsContext) {
+	ctx := (unsafe.Pointer)(C.JS_GetContextOpaque(c))
+	return (*JsContext)(ctx)
+}
+
 func freeJsContext(ctx *JsContext) {
-	// fmt.Printf("context freed\n")
-	ctx.valCache.Quit()
+	fmt.Printf("context freed\n")
 	c := ctx.c
 	C.JS_FreeValue(c, ctx.global)
 	freeContext(c)
+	ctx.env = nil
 }
 
 func freeContext(ctx *C.JSContext) {
@@ -68,11 +78,11 @@ func loadPreludeModules(ctx *C.JSContext) {
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
-	scriptCstr := C.CString(script)
-	defer C.free(unsafe.Pointer(scriptCstr))
-	scriptClen := C.size_t(len(script))
+	var cstr *C.char
+	var length C.int
+	getStrPtrLen(&script, &cstr, &length)
 
-	return ctx.eval(scriptCstr, scriptClen, noname, env)
+	return ctx.eval(cstr, C.size_t(length), noname, env)
 }
 
 func (ctx *JsContext) EvalFile(scriptFile string, env map[string]interface{}) (res interface{}, err error) {
@@ -105,20 +115,32 @@ func (ctx *JsContext) eval(scriptCstr *C.char, scriptClen C.size_t, filename str
 	return
 }
 
-
-func (ctx *JsContext) setEnv(env map[string]interface{}) error {
+func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
+	ctx.env = env
 	c := ctx.c
+
+	var jsVal C.JSValue
 	for k, _ := range env {
 		v := env[k]
-		jsVal, err := makeJsValue(ctx, v)
-		if err != nil {
-			return err
-		}
+
 		cstr := C.CString(k)
+		defer C.free(unsafe.Pointer(cstr))
+
+		if v == nil {
+			jsVal = C.JS_UNDEFINED
+		} else {
+			vv := reflect.ValueOf(v)
+			if vv.Kind() == reflect.Func {
+				jsVal = bindGoFunc(c, k, vv)
+			} else {
+				if jsVal, err = makeJsValue(c, v); err != nil {
+					return err
+				}
+			}
+		}
 		C.JS_SetPropertyStr(c, ctx.global, cstr, jsVal)
-		C.free(unsafe.Pointer(cstr))
 	}
-	return nil
+	return
 }
 
 func getVar(c *C.JSContext, global C.JSValue, name string) (v C.JSValue, err error) {

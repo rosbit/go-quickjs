@@ -14,70 +14,56 @@ import (
 	"strings"
 )
 
-type jsValueI interface {
-	Value(*C.JSContext) C.JSValue
-}
+func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
+	if v == nil {
+		return C.JS_NULL, nil
+	}
 
-var (
-	_ jsValueI = null
-	_ jsValueI = undefined
-	_ jsValueI = exception
-	_ jsValueI = jsBool(false)
-	_ jsValueI = jsInt32(0)
-	_ jsValueI = jsInt64(0)
-	_ jsValueI = jsFloat64(0.0)
-	_ jsValueI = jsString("")
-	_ jsValueI = jsArray(C.JS_UNDEFINED)
-	_ jsValueI = jsObject(C.JS_UNDEFINED)
-	_ jsValueI = goFunction(C.JS_UNDEFINED)
-)
-
-func makeJsValue(c *JsContext, v interface{}) (C.JSValue, error) {
-	ctx := c.c
 	vv := reflect.ValueOf(v)
 	switch vv.Kind() {
 	case reflect.Bool:
-		return jsBool(v.(bool)).Value(ctx), nil
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-	     reflect.Uint,reflect.Uint8,reflect.Uint16,reflect.Uint32,reflect.Uint64:
-		return makeInt(ctx, v), nil
+		if v.(bool) {
+			return C.JS_TRUE, nil
+		} else {
+			return C.JS_FALSE, nil
+		}
+	case reflect.Int8, reflect.Int16, reflect.Int32:
+		return C.JS_NewInt32(ctx, C.int32_t(int32(vv.Int()))), nil
+	case reflect.Int, reflect.Int64:
+		return C.JS_NewInt64(ctx, C.int64_t(vv.Int())), nil
+	case reflect.Uint8,reflect.Uint16:
+		return C.JS_NewInt32(ctx, C.int32_t(int32(vv.Uint()))), nil
+	case reflect.Uint,reflect.Uint32:
+		return C.JS_NewInt64(ctx, C.int64_t(int64(vv.Uint()))), nil
+	case reflect.Uint64:
+		vU64 := vv.Uint()
+		if vU64 & (uint64(1) << 63) == 0 {
+			return C.JS_NewInt64(ctx, C.int64_t(int64(vU64))), nil
+		}
+		return C.JS_NewFloat64(ctx, C.double(float64(vU64))), nil
 	case reflect.Float32, reflect.Float64:
-		return	jsFloat64(vv.Float()).Value(ctx), nil
+		return	C.JS_NewFloat64(ctx, C.double(vv.Float())), nil
 	case reflect.String:
-		return jsString(v.(string)).Value(ctx), nil
+		return makeString(ctx, v.(string)), nil
 	case reflect.Slice:
 		t := vv.Type()
 		if t.Elem().Kind() == reflect.Uint8 {
-			return jsString(string(v.([]byte))).Value(ctx), nil
+			return makeBytes(ctx, v.([]byte)), nil
 		}
 		fallthrough
 	case reflect.Array:
-		if jsArr, err := newJsArray(c, v); err != nil {
-			return C.JS_UNDEFINED, err
-		} else {
-			return jsArr.Value(ctx), nil
-		}
-	case reflect.Map, reflect.Struct:
-		if jsObj, err := newJsObject(c, v); err != nil {
-			return C.JS_UNDEFINED, err
-		} else {
-			return jsObj.Value(ctx), nil
-		}
+		return makeJsArray(ctx, vv)
+	case reflect.Map:
+		return makeJsObj(ctx, vv)
+	case reflect.Struct:
+		return struct2Object(ctx, vv), nil
 	case reflect.Ptr:
 		if vv.Elem().Kind() == reflect.Struct {
-			if jsObj, err := newJsObject(c, v); err != nil {
-				return C.JS_UNDEFINED, err
-			} else {
-				return jsObj.Value(ctx), nil
-			}
+			return struct2Object(ctx, vv), nil
 		}
-		return makeJsValue(c, vv.Elem().Interface())
+		return makeJsValue(ctx, vv.Elem().Interface())
 	case reflect.Func:
-		if goFunc, err := bindGoFunc(c, "", v); err != nil {
-			return C.JS_UNDEFINED, err
-		} else {
-			return goFunc.Value(ctx), nil
-		}
+		return bindGoFunc(ctx, "", vv), nil
 	default:
 		return C.JS_UNDEFINED, fmt.Errorf("unsupported type %v", vv.Kind())
 	}
@@ -86,7 +72,7 @@ func makeJsValue(c *JsContext, v interface{}) (C.JSValue, error) {
 func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	switch {
 	case C.JS_IsException(jsVal) != 0:
-		exVal := exception.Value(ctx)
+		exVal := C.JS_GetException(ctx)
 		goVal, err = fromJsValue(ctx, exVal)
 		C.JS_FreeValue(ctx, exVal)
 		if err != nil {
@@ -109,14 +95,16 @@ func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 		goVal = float64(f)
 		return
 	case C.JS_IsString(jsVal) != 0:
-		cstr := C.JS_ToCString(ctx, jsVal)
-		goVal = C.GoString(cstr)
+		var plen C.size_t
+		cstr := C.JS_ToCStringLen(ctx, &plen, jsVal)
+		goVal = C.GoStringN(cstr, C.int(plen))
 		C.JS_FreeCString(ctx, cstr)
 		return
 	case C.JS_IsArray(ctx, jsVal) != 0:
 		return fromJsArray(ctx, jsVal)
 	case C.JS_IsFunction(ctx, jsVal) != 0:
-		return createJsFunc(ctx, jsVal)
+		goVal = jsVal
+		return
 	case C.JS_IsObject(jsVal) != 0:
 		return fromJsObject(ctx, jsVal)
 	default:
@@ -125,109 +113,38 @@ func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	}
 }
 
-// null
-type nullType byte
-const null = nullType(0)
-func (n nullType) Value(ctx *C.JSContext) C.JSValue {
-	return C.JS_NULL
+func makeString(ctx *C.JSContext, s string) C.JSValue {
+	var cstr *C.char
+	var sLen C.int
+	getStrPtrLen(&s, &cstr, &sLen)
+	return C.JS_NewStringLen(ctx, cstr, C.size_t(sLen))
 }
 
-// undefined
-type undefinedType byte
-const undefined = undefinedType(0)
-func (u undefinedType) Value(ctx *C.JSContext) C.JSValue {
-	return C.JS_UNDEFINED
+func makeBytes(ctx *C.JSContext, b []byte) C.JSValue {
+	var cstr *C.char
+	var sLen C.int
+	getBytesPtrLen(b, &cstr, &sLen)
+	return C.JS_NewStringLen(ctx, cstr, C.size_t(sLen))
 }
 
-// exception
-type exceptionType C.JSValue
-var exception exceptionType = exceptionType(C.JS_EXCEPTION)
-func (e exceptionType) Value(ctx *C.JSContext) C.JSValue {
-	exVal := C.JS_GetException(ctx)
-	return exVal
-}
-
-// bool
-type jsBool bool
-func (b jsBool) Value(ctx *C.JSContext) C.JSValue {
-	if b {
-		return C.JS_TRUE
-	} else {
-		return C.JS_FALSE
-	}
-}
-
-func makeInt(ctx *C.JSContext, i interface{}) C.JSValue {
-	switch i.(type) {
-	case int8,int16,int32:
-		return jsInt32(int32(reflect.ValueOf(i).Int())).Value(ctx)
-	case int,int64:
-		return jsInt64(reflect.ValueOf(i).Int()).Value(ctx)
-	case uint8,uint16:
-		return jsInt32(int32(reflect.ValueOf(i).Uint())).Value(ctx)
-	case uint,uint32,uint64:
-		return jsInt64(int64(reflect.ValueOf(i).Uint())).Value(ctx)
-	default:
-		return undefined.Value(ctx)
-	}
-}
-
-// jsInt32
-type jsInt32 int32
-func (i jsInt32) Value(ctx *C.JSContext) C.JSValue {
-	return C.JS_NewInt32(ctx, C.int32_t(i))
-}
-
-// jsInt64
-type jsInt64 int64
-func (i jsInt64) Value(ctx *C.JSContext) C.JSValue {
-	return C.JS_NewInt64(ctx, C.int64_t(i))
-}
-
-// jsFloat64
-type jsFloat64 float64
-func (f jsFloat64) Value(ctx *C.JSContext) C.JSValue {
-	return C.JS_NewFloat64(ctx, C.double(f))
-}
-
-// jsString
-type jsString string
-func (s jsString) Value(ctx *C.JSContext) C.JSValue {
-	cstr := C.CString(string(s))
-	defer C.free(unsafe.Pointer(cstr))
-	return C.JS_NewString(ctx, cstr)
-}
-
-// jsArray
-type jsArray C.JSValue
-func newJsArray(c *JsContext, a interface{}) (jsArr jsArray, err error) {
-	ctx := c.c
-	if a == nil {
-		jsArr = jsArray(C.JS_UNDEFINED)
+func makeJsArray(ctx *C.JSContext, v reflect.Value) (ja C.JSValue, err error) {
+	if v.IsNil() {
+		ja = C.JS_UNDEFINED
 		return
 	}
-	v := reflect.ValueOf(a)
-	switch v.Kind() {
-	case reflect.Slice, reflect.Array:
-		ja := C.JS_NewArray(ctx)
-		l := v.Len()
-		for i:=0; i<l; i++ {
-			e := v.Index(i).Interface()
-			ev, err := makeJsValue(c, e)
-			if err != nil {
-				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
-			} else {
-				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), ev)
-			}
+
+	ja = C.JS_NewArray(ctx)
+	l := v.Len()
+	for i:=0; i<l; i++ {
+		e := v.Index(i).Interface()
+		ev, err := makeJsValue(ctx, e)
+		if err != nil {
+			C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
+		} else {
+			C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), ev)
 		}
-		jsArr = jsArray(ja)
-		return
-	case reflect.Ptr:
-		return newJsArray(c, v.Elem().Interface())
-	default:
-		err = fmt.Errorf("slice or array expected")
-		return
 	}
+	return
 }
 func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	arrLength := C.CString("length")
@@ -247,7 +164,7 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	for i:=0; i<l; i++ {
 		eJsV := C.JS_GetPropertyUint32(ctx, jsVal, C.uint32_t(i))
 		if C.JS_IsException(eJsV) != 0 {
-			exVal := exception.Value(ctx)
+			exVal := C.JS_GetException(ctx)
 			goExVal, e := fromJsValue(ctx, exVal)
 			C.JS_FreeValue(ctx, exVal)
 			if e != nil {
@@ -268,51 +185,31 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	goVal = res
 	return
 }
-func (a jsArray) Value(ctx *C.JSContext) C.JSValue {
-	return C.JSValue(a)
-}
 
-// jsObject
-type jsObject C.JSValue
-func newJsObject(c *JsContext, o interface{}) (jsObj jsObject, err error) {
-	ctx := c.c
-	if o == nil {
-		jsObj = jsObject(C.JS_UNDEFINED)
+func makeJsObj(ctx *C.JSContext, v reflect.Value) (jo C.JSValue, err error) {
+	if v.IsNil() {
+		jo = C.JS_UNDEFINED
 		return
 	}
-	v := reflect.ValueOf(o)
-	switch v.Kind() {
-	case reflect.Map:
-		jo := C.JS_NewObject(ctx)
-		mr := v.MapRange()
-		for mr.Next() {
-			k := mr.Key()
-			v := mr.Value()
 
-			cstr := C.CString(k.String())
-			ev, err := makeJsValue(c, v.Interface())
-			if err != nil {
-				C.JS_SetPropertyStr(ctx, jo, cstr, C.JS_NULL)
-			} else {
-				C.JS_SetPropertyStr(ctx, jo, cstr, ev)
-			}
-			C.free(unsafe.Pointer(cstr))
+	jo = C.JS_NewObject(ctx)
+	mr := v.MapRange()
+	for mr.Next() {
+		k := mr.Key()
+		v := mr.Value()
+
+		cstr := C.CString(k.String())
+		ev, err := makeJsValue(ctx, v.Interface())
+		if err != nil {
+			C.JS_SetPropertyStr(ctx, jo, cstr, C.JS_NULL)
+		} else {
+			C.JS_SetPropertyStr(ctx, jo, cstr, ev)
 		}
-		jsObj = jsObject(jo)
-		return
-	case reflect.Struct:
-		return struct2Object(c, v)
-	case reflect.Ptr:
-		ev := v.Elem()
-		if ev.Kind() == reflect.Struct {
-			return struct2Object(c, v)
-		}
-		return newJsObject(c, ev.Interface())
-	default:
-		err = fmt.Errorf("map expected")
-		return
+		C.free(unsafe.Pointer(cstr))
 	}
+	return
 }
+
 func fromJsObject(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	var tab_atom *C.JSPropertyEnum
 	var tab_atom_count C.uint32_t
@@ -348,12 +245,9 @@ freeAtoms:
 	goVal = res
 	return
 }
-func (o jsObject) Value(ctx *C.JSContext) C.JSValue {
-	return C.JSValue(o)
-}
 
 // struct
-func struct2Object(ctx *JsContext, structVar reflect.Value) (jsObj jsObject, err error) {
+func struct2Object(ctx *C.JSContext, structVar reflect.Value) (jo C.JSValue) {
 	var structE reflect.Value
 	if structVar.Kind() == reflect.Ptr {
 		structE = structVar.Elem()
@@ -371,11 +265,7 @@ func struct2Object(ctx *JsContext, structVar reflect.Value) (jsObj jsObject, err
 		structE = structVar.Elem()       // structE is the copied struct
 	}*/
 
-	jo := C.JS_NewObject(ctx.c)
-	if err = makeStructFields(ctx, jo, structE, structT); err != nil {
-		return
-	}
-	jsObj = jsObject(jo)
+	jo = makeStructFields(ctx, structE, structT)
 	return
 }
 
@@ -386,8 +276,8 @@ func upperFirst(name string) string {
 	return strings.ToUpper(name[:1]) + name[1:]
 }
 
-func makeStructFields(c *JsContext, jo C.JSValue, structE reflect.Value, structT reflect.Type) (err error) {
-	ctx := c.c
+func makeStructFields(ctx *C.JSContext, structE reflect.Value, structT reflect.Type) (jo C.JSValue) {
+	jo = C.JS_NewObject(ctx)
 	for i:=0; i<structT.NumField(); i++ {
 		name := structT.Field(i).Name
 		fv := structE.FieldByName(name)
@@ -395,8 +285,7 @@ func makeStructFields(c *JsContext, jo C.JSValue, structE reflect.Value, structT
 			continue
 		}
 		cstr := C.CString(lowerFirst(name))
-		ev, err := makeJsValue(c, fv.Interface())
-		if err != nil {
+		if ev, err := makeJsValue(ctx, fv.Interface()); err != nil {
 			C.JS_SetPropertyStr(ctx, jo, cstr, C.JS_NULL)
 		} else {
 			C.JS_SetPropertyStr(ctx, jo, cstr, ev)
@@ -406,15 +295,3 @@ func makeStructFields(c *JsContext, jo C.JSValue, structE reflect.Value, structT
 	return
 }
 
-// function
-type goFunction C.JSValue
-func (f goFunction) Value(ctx *C.JSContext) C.JSValue {
-	return C.JSValue(f)
-}
-
-// jsFunction
-type jsFunction C.JSValue
-func createJsFunc(ctx *C.JSContext, jsVal C.JSValue) (jsFunc jsFunction, err error) {
-	jsFunc = jsFunction(jsVal)
-	return
-}

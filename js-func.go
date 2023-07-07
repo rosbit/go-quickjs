@@ -28,7 +28,7 @@ func (ctx *JsContext) wrapFunc(jsFunc C.JSValue, helper *elutils.EmbeddingFuncHe
 		// make js args
 		itArgs := helper.MakeGoFuncArgs(args)
 		for arg := range itArgs {
-			jsVal, err := makeJsValue(ctx, arg)
+			jsVal, err := makeJsValue(c, arg)
 			if err != nil {
 				jsArgs = append(jsArgs, C.JS_UNDEFINED)
 			} else {
@@ -60,7 +60,7 @@ func (ctx *JsContext) callFunc(fn C.JSValue, args ...interface{}) (res C.JSValue
 	l := len(args)
 	jsArgs := make([]C.JSValue, l)
 	for i, arg := range args {
-		jsVal, e := makeJsValue(ctx, arg)
+		jsVal, e := makeJsValue(c, arg)
 		if e != nil {
 			err = e
 			return
