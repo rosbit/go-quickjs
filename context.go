@@ -50,7 +50,7 @@ func getContext(c *C.JSContext) (*JsContext) {
 }
 
 func freeJsContext(ctx *JsContext) {
-	fmt.Printf("context freed\n")
+	// fmt.Printf("context freed\n")
 	c := ctx.c
 	C.JS_FreeValue(c, ctx.global)
 	freeContext(c)
