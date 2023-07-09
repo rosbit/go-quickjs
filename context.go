@@ -2,6 +2,9 @@ package quickjs
 
 /*
 #include "quickjs-libc.h"
+static int getValTag(JSValueConst v) {
+	return JS_VALUE_GET_TAG(v);
+}
 */
 import "C"
 import (
@@ -24,7 +27,8 @@ func NewContext() (*JsContext, error) {
 	if rt == (*C.JSRuntime)(unsafe.Pointer(nil)) {
 		return nil, fmt.Errorf("failed to create Runtime")
 	}
-	ctx := C.JS_NewContext(rt)
+	// ctx := C.JS_NewContext(rt)
+	ctx := createCustomerContext(rt)
 	if ctx == (*C.JSContext)(unsafe.Pointer(nil)) {
 		C.JS_FreeRuntime(rt)
 		return nil, fmt.Errorf("failed to create context")
@@ -37,6 +41,16 @@ func NewContext() (*JsContext, error) {
 	bindContext(c)
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
+}
+
+func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
+	C.js_std_init_handlers(rt)
+	ctx := C.JS_NewContext(rt)
+	if ctx == (*C.JSContext)(unsafe.Pointer(nil)) {
+		return ctx
+	}
+	C.JS_SetModuleLoaderFunc(rt, (*C.JSModuleNormalizeFunc)(unsafe.Pointer(nil)), (*C.JSModuleLoaderFunc)(C.js_module_loader), unsafe.Pointer(nil))
+	return ctx
 }
 
 func bindContext(ctx *JsContext) {
@@ -59,6 +73,7 @@ func freeJsContext(ctx *JsContext) {
 
 func freeContext(ctx *C.JSContext) {
 	rt := C.JS_GetRuntime(ctx)
+	C.js_std_free_handlers(rt)
 	C.JS_FreeContext(ctx)
 	C.JS_FreeRuntime(rt)
 }
@@ -66,15 +81,14 @@ func freeContext(ctx *C.JSContext) {
 func loadPreludeModules(ctx *C.JSContext) {
 	C.js_std_add_helpers(ctx, 0, (**C.char)(unsafe.Pointer(nil)))
 
-	/*
-	stdStr := C.CString("std")
-	C.js_init_module_std(ctx, stdStr)
-	C.free(unsafe.Pointer(stdStr))
+	stdStr := "std\x00"
+	var cstr *C.char
+	getStrPtr(&stdStr, &cstr)
+	C.js_init_module_std(ctx, cstr)
 
-	osStr := C.CString("os")
-	C.js_init_module_os(ctx, osStr)
-	C.free(unsafe.Pointer(osStr))
-	*/
+	osStr := "os\x00"
+	getStrPtr(&osStr, &cstr)
+	C.js_init_module_os(ctx, cstr)
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
@@ -109,8 +123,22 @@ func (ctx *JsContext) eval(scriptCstr *C.char, scriptClen C.size_t, filename str
 	defer C.free(unsafe.Pointer(scriptFileCstr))
 
 	c := ctx.c
-	jsVal := C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, C.int(0))
+	isModule := C.JS_DetectModule(scriptCstr, scriptClen) != 0
+	var jsVal C.JSValue
+	if isModule {
+		jsVal = C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, C.JS_EVAL_TYPE_MODULE | C.JS_EVAL_FLAG_COMPILE_ONLY)
+		if C.JS_IsException(jsVal) == 0 {
+			if C.getValTag(jsVal) == C.JS_TAG_MODULE {
+				C.js_module_set_import_meta(c, jsVal, 1, 1)
+				jsVal = C.JS_EvalFunction(c, jsVal)
+				goto EXIT
+			}
+		}
+	} else {
+		jsVal = C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, 0)
+	}
 	res, err = fromJsValue(c, jsVal)
+EXIT:
 	C.JS_FreeValue(c, jsVal)
 	return
 }
@@ -157,7 +185,8 @@ func getVar(c *C.JSContext, global C.JSValue, name string) (v C.JSValue, err err
 func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 	c := ctx.c
 
-	r, e := getVar(c, ctx.global, name)
+	// r, e := getVar(c, ctx.global, name)
+	r, e := ctx.getVar(name)
 	if e != nil {
 		err = e
 		return
@@ -168,10 +197,19 @@ func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 	return
 }
 
+func (ctx *JsContext) getVar(name string) (C.JSValue, error) {
+	/*
+	if C.getValTag(ctx.m) == C.JS_TAG_MODULE {
+		return getVar(ctx.c, ctx.m, name)
+	}*/
+	return getVar(ctx.c, ctx.global, name)
+}
+
 func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interface{}, err error) {
 	c := ctx.c
 
-	v, e := getVar(c, ctx.global, funcName)
+	// v, e := getVar(c, ctx.global, funcName)
+	v, e := ctx.getVar(funcName)
 	if e != nil {
 		err = e
 		return
@@ -207,7 +245,8 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 
 	c := ctx.c
 
-	v, e := getVar(c, ctx.global, funcName)
+	// v, e := getVar(c, ctx.global, funcName)
+	v, e := ctx.getVar(funcName)
 	if e != nil {
 		err = e
 		return
@@ -222,11 +261,11 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 }
 
 func (ctx *JsContext) BindFuncs(funcName2FuncVarPtr map[string]interface{}) (err error) {
-    for funcName, funcVarPtr := range funcName2FuncVarPtr {
-        if err = ctx.BindFunc(funcName, funcVarPtr); err != nil {
-            return
-        }
-    }
-    return
+	for funcName, funcVarPtr := range funcName2FuncVarPtr {
+		if err = ctx.BindFunc(funcName, funcVarPtr); err != nil {
+			return
+		}
+	}
+	return
 }
 

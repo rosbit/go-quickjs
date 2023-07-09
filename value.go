@@ -72,22 +72,12 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	switch {
 	case C.JS_IsException(jsVal) != 0:
-		exVal := C.JS_GetException(ctx)
-		goVal, err = fromJsValue(ctx, exVal)
-		C.JS_FreeValue(ctx, exVal)
-		if err != nil {
-			return
-		}
-		err = fmt.Errorf("excpetion occured: %v", goVal)
+		err = fromJsException(ctx)
 		return
 	case C.JS_IsNull(jsVal) != 0 || C.JS_IsUndefined(jsVal) != 0:
 		return
 	case C.JS_IsBool(jsVal) != 0:
-		b := int(C.JS_ToBool(ctx, jsVal))
-		if b == 0 {
-			goVal = false
-		}
-		goVal = true
+		goVal = C.JS_ToBool(ctx, jsVal) != 0
 		return
 	case C.JS_IsNumber(jsVal) != 0:
 		var f C.double
@@ -147,9 +137,14 @@ func makeJsArray(ctx *C.JSContext, v reflect.Value) (ja C.JSValue, err error) {
 	return
 }
 func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
-	arrLength := C.CString("length")
+	length := "length\x00"
+	var arrLength *C.char
+	getStrPtr(&length, &arrLength)
+	// arrLength := C.CString("length")
 	arrLen := C.JS_GetPropertyStr(ctx, jsVal, arrLength)
-	C.free(unsafe.Pointer(arrLength))
+	// C.free(unsafe.Pointer(arrLength))
+	defer C.JS_FreeValue(ctx, arrLen)
+
 	var l int
 	if C.JS_IsNumber(arrLen) != 0 {
 		var jsL C.int32_t
@@ -164,14 +159,8 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	for i:=0; i<l; i++ {
 		eJsV := C.JS_GetPropertyUint32(ctx, jsVal, C.uint32_t(i))
 		if C.JS_IsException(eJsV) != 0 {
-			exVal := C.JS_GetException(ctx)
-			goExVal, e := fromJsValue(ctx, exVal)
-			C.JS_FreeValue(ctx, exVal)
-			if e != nil {
-				err = e
-				return
-			}
-			err = fmt.Errorf("exception when get %d element of array: %v", i, goExVal)
+			err = fromJsException(ctx)
+			// err = fmt.Errorf("exception when get %d element of array\n", i)
 			return
 		}
 		ev, e := fromJsValue(ctx, eJsV)
@@ -295,3 +284,35 @@ func makeStructFields(ctx *C.JSContext, structE reflect.Value, structT reflect.T
 	return
 }
 
+func getPropertyStr(ctx *C.JSContext, jsVal C.JSValue, czStr string) C.JSValue {
+	var prop *C.char
+	getStrPtr(&czStr, &prop)
+	return C.JS_GetPropertyStr(ctx, jsVal, prop)
+}
+
+func getExceptionStr(ctx *C.JSContext, exVal C.JSValue) string {
+	str := C.JS_ToCString(ctx, exVal)
+	if str == (*C.char)(unsafe.Pointer(nil)) {
+		return "[exception]"
+	}
+	defer C.JS_FreeCString(ctx, str)
+	return C.GoString(str)
+}
+
+func fromJsException(ctx *C.JSContext) (err error) {
+	exVal := C.JS_GetException(ctx)
+	defer C.JS_FreeValue(ctx, exVal)
+
+	exceptionStr := getExceptionStr(ctx, exVal)
+	if C.JS_IsError(ctx, exVal) == 0 {
+		err = fmt.Errorf("%s", exceptionStr)
+		return
+	}
+	val := getPropertyStr(ctx, exVal, "stack\x00")
+	defer C.JS_FreeValue(ctx, val)
+
+	if C.JS_IsUndefined(val) == 0 {
+		err = fmt.Errorf("%s\n%s", exceptionStr, getExceptionStr(ctx, val))
+	}
+	return
+}
