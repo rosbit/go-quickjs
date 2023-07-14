@@ -18,7 +18,6 @@ const noname = ""
 
 type JsContext struct {
 	c *C.JSContext
-	env map[string]interface{}
 	global C.JSValue
 }
 
@@ -38,7 +37,6 @@ func NewContext() (*JsContext, error) {
 		c: ctx,
 		global: C.JS_GetGlobalObject(ctx),
 	}
-	bindContext(c)
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
 }
@@ -53,6 +51,7 @@ func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
 	return ctx
 }
 
+/*
 func bindContext(ctx *JsContext) {
 	c := ctx.c
 	C.JS_SetContextOpaque(c, unsafe.Pointer(ctx))
@@ -61,14 +60,14 @@ func bindContext(ctx *JsContext) {
 func getContext(c *C.JSContext) (*JsContext) {
 	ctx := (unsafe.Pointer)(C.JS_GetContextOpaque(c))
 	return (*JsContext)(ctx)
-}
+}*/
 
 func freeJsContext(ctx *JsContext) {
 	// fmt.Printf("context freed\n")
 	c := ctx.c
+	ptrs.delPtrStore((uintptr(unsafe.Pointer(c))))
 	C.JS_FreeValue(c, ctx.global)
 	freeContext(c)
-	ctx.env = nil
 }
 
 func freeContext(ctx *C.JSContext) {
@@ -144,7 +143,6 @@ EXIT:
 }
 
 func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
-	ctx.env = env
 	c := ctx.c
 
 	var jsVal C.JSValue
@@ -159,7 +157,7 @@ func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
 		} else {
 			vv := reflect.ValueOf(v)
 			if vv.Kind() == reflect.Func {
-				jsVal = bindGoFunc(c, k, vv)
+				jsVal = bindGoFunc(c, v)
 			} else {
 				if jsVal, err = makeJsValue(c, v); err != nil {
 					return err

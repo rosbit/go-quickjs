@@ -63,7 +63,7 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 		}
 		return makeJsValue(ctx, vv.Elem().Interface())
 	case reflect.Func:
-		return bindGoFunc(ctx, "", vv), nil
+		return bindGoFunc(ctx, v), nil
 	default:
 		return C.JS_UNDEFINED, fmt.Errorf("unsupported type %v", vv.Kind())
 	}
@@ -140,9 +140,7 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 	length := "length\x00"
 	var arrLength *C.char
 	getStrPtr(&length, &arrLength)
-	// arrLength := C.CString("length")
 	arrLen := C.JS_GetPropertyStr(ctx, jsVal, arrLength)
-	// C.free(unsafe.Pointer(arrLength))
 	defer C.JS_FreeValue(ctx, arrLen)
 
 	var l int
@@ -245,16 +243,15 @@ func struct2Object(ctx *C.JSContext, structVar reflect.Value) (jo C.JSValue) {
 	}
 	structT := structE.Type()
 
-	/*
 	if structE == structVar {
 		// struct is unaddressable, so make a copy of struct to an Elem of struct-pointer.
 		// NOTE: changes of the copied struct cannot effect the original one. it is recommended to use the pointer of struct.
 		structVar = reflect.New(structT) // make a struct pointer
 		structVar.Elem().Set(structE)    // copy the old struct
 		structE = structVar.Elem()       // structE is the copied struct
-	}*/
+	}
 
-	jo = makeStructFields(ctx, structE, structT)
+	jo = makeStructFields(ctx, structVar, structE, structT)
 	return
 }
 
@@ -265,7 +262,7 @@ func upperFirst(name string) string {
 	return strings.ToUpper(name[:1]) + name[1:]
 }
 
-func makeStructFields(ctx *C.JSContext, structE reflect.Value, structT reflect.Type) (jo C.JSValue) {
+func makeStructFields(ctx *C.JSContext, structVar, structE reflect.Value, structT reflect.Type) (jo C.JSValue) {
 	jo = C.JS_NewObject(ctx)
 	for i:=0; i<structT.NumField(); i++ {
 		name := structT.Field(i).Name
@@ -281,7 +278,24 @@ func makeStructFields(ctx *C.JSContext, structE reflect.Value, structT reflect.T
 		}
 		C.free(unsafe.Pointer(cstr))
 	}
+
+	makeStructMethods(ctx, &jo, structE, structT)
+	t := structVar.Type()
+	makeStructMethods(ctx, &jo, structVar, t)
 	return
+}
+
+func makeStructMethods(ctx *C.JSContext, jo *C.JSValue, structE reflect.Value, structT reflect.Type) {
+	for i:=0; i<structE.NumMethod(); i++ {
+		name := structT.Method(i).Name
+		fv := structE.Method(i)
+		if !fv.CanInterface() {
+			continue
+		}
+		cstr := C.CString(lowerFirst(name))
+		C.JS_SetPropertyStr(ctx, *jo, cstr, bindGoFunc(ctx, fv.Interface()))
+		C.free(unsafe.Pointer(cstr))
+	}
 }
 
 func getPropertyStr(ctx *C.JSContext, jsVal C.JSValue, czStr string) C.JSValue {
