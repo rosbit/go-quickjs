@@ -43,7 +43,7 @@ func NewContext() (*JsContext, error) {
 }
 
 func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
-	C.js_std_init_handlers(rt)
+	// C.js_std_init_handlers(rt)
 	ctx := C.JS_NewContext(rt)
 	if ctx == (*C.JSContext)(unsafe.Pointer(nil)) {
 		return ctx
@@ -139,23 +139,17 @@ func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
 	var jsVal C.JSValue
 	for k, _ := range env {
 		v := env[k]
+		if v == nil {
+			continue
+		}
+
+		if jsVal, err = makeJsValue(c, v); err != nil {
+			return
+		}
 
 		cstr := C.CString(k)
-		defer C.free(unsafe.Pointer(cstr))
-
-		if v == nil {
-			jsVal = C.JS_UNDEFINED
-		} else {
-			vv := reflect.ValueOf(v)
-			if vv.Kind() == reflect.Func {
-				jsVal = bindGoFunc(c, v)
-			} else {
-				if jsVal, err = makeJsValue(c, v); err != nil {
-					return err
-				}
-			}
-		}
 		C.JS_SetPropertyStr(c, ctx.global, cstr, jsVal)
+		C.free(unsafe.Pointer(cstr))
 	}
 	return
 }

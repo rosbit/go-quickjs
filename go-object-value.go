@@ -107,9 +107,6 @@ func go_arr_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSValueC
 		return 0
 	}
 	dest := vv.Index(idx)
-	if _, ok := goVal.(string); ok {
-		goVal = fmt.Sprintf("%s", goVal) // deep copy
-	}
 	if err = elutils.SetValue(dest, goVal); err != nil {
 		return 0
 	}
@@ -133,9 +130,6 @@ func go_map_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSValueC
 	mapT := vv.Type()
 	elType := mapT.Elem()
 	dest := elutils.MakeValue(elType)
-	if _, ok := goVal.(string); ok {
-		goVal = fmt.Sprintf("%s", goVal) // deep copy
-	}
 	if err = elutils.SetValue(dest, goVal); err == nil {
 		vv.SetMapIndex(reflect.ValueOf(key), dest)
 		return 1
@@ -202,9 +196,6 @@ func go_struct_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSVal
 	fv := structE.FieldByName(name)
 	if !fv.IsValid() {
 		return 0
-	}
-	if _, ok := goVal.(string); ok {
-		goVal = fmt.Sprintf("%s", goVal) // deep copy
 	}
 	if err = elutils.SetValue(fv, goVal); err != nil {
 		return 0
