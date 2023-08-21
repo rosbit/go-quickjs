@@ -21,19 +21,14 @@ func bindGoFunc(ctx *C.JSContext, fnVarPtr interface{}) (goFunc C.JSValue) {
 	return
 }
 
-func getPtrSotre(ctx *C.JSContext) (ptr *ptrStore) {
-	ptr = ptrs.getPtrStore(uintptr(unsafe.Pointer(ctx)))
-	return
-}
-
 //export goFuncBridge
 func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C.JSValueConst, magic C.int, func_data *C.JSValue) C.JSValue {
 	// get function idx
-	var jsIdx C.int32_t
-	C.JS_ToInt32(ctx, &jsIdx, *func_data)
-	idx := int(jsIdx)
+	var jsIdx C.uint32_t
+	C.JS_ToUint32(ctx, &jsIdx, *func_data)
+	idx := uint32(jsIdx)
 
-	ptr := getPtrSotre(ctx)
+	ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
 	fnPtr, ok := ptr.lookup(idx)
 	if !ok {
 		return C.JS_UNDEFINED
@@ -49,7 +44,7 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	}
 	fnType := fnVal.Type()
 
-	helper := elutils.NewGolangFuncHelperDiretly(fnVal, fnType)
+	helper := elutils.NewGolangFuncHelperDirectly(fnVal, fnType)
 	getArgs := func(i int) interface{} {
 		jsArg := C.getArg(argv, C.int(i))
 		if goVal, err := fromJsValue(ctx, jsArg); err == nil {
@@ -67,31 +62,18 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 		return C.JS_UNDEFINED
 	}
 
-	if vv, ok := v.([]interface{}); ok {
-		ja := C.JS_NewArray(ctx)
-		for i, rv := range vv {
-			jsVal, err := makeJsValue(ctx, rv)
-			if err != nil {
-				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), C.JS_NULL)
-			} else {
-				C.JS_SetPropertyUint32(ctx, ja, C.uint32_t(i), jsVal)
-			}
-		}
-		return ja
-	} else {
-		jsVal, err := makeJsValue(ctx, v)
-		if err != nil {
-			emsg := makeString(ctx, err.Error())
-			return C.JS_Throw(ctx, emsg)
-		}
-		return jsVal
+	jsVal, err := makeJsValue(ctx, v)
+	if err != nil {
+		emsg := makeString(ctx, err.Error())
+		return C.JS_Throw(ctx, emsg)
 	}
+	return jsVal
 }
 
 func wrapGoFunc(ctx *C.JSContext, fnVar interface{}, fnType reflect.Type) C.JSValue {
-	ptr := getPtrSotre(ctx)
+	ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
 	idx := ptr.register(&fnVar)
-	jsIdx := C.JS_NewInt32(ctx, C.int32_t(idx))
+	jsIdx := C.JS_NewUint32(ctx, C.uint32_t(idx))
 	defer C.JS_FreeValue(ctx, jsIdx)
 
 	// create a JS function

@@ -37,6 +37,7 @@ func NewContext() (*JsContext, error) {
 		c: ctx,
 		global: C.JS_GetGlobalObject(ctx),
 	}
+	registerGoObjectClass(rt)
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
 }
@@ -51,34 +52,24 @@ func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
 	return ctx
 }
 
-/*
-func bindContext(ctx *JsContext) {
-	c := ctx.c
-	C.JS_SetContextOpaque(c, unsafe.Pointer(ctx))
-}
-
-func getContext(c *C.JSContext) (*JsContext) {
-	ctx := (unsafe.Pointer)(C.JS_GetContextOpaque(c))
-	return (*JsContext)(ctx)
-}*/
-
 func freeJsContext(ctx *JsContext) {
 	// fmt.Printf("context freed\n")
 	c := ctx.c
-	ptrs.delPtrStore((uintptr(unsafe.Pointer(c))))
+	delPtrStore((uintptr(unsafe.Pointer(c))))
 	C.JS_FreeValue(c, ctx.global)
 	freeContext(c)
 }
 
 func freeContext(ctx *C.JSContext) {
 	rt := C.JS_GetRuntime(ctx)
-	C.js_std_free_handlers(rt)
+	// C.js_std_free_handlers(rt)
 	C.JS_FreeContext(ctx)
 	C.JS_FreeRuntime(rt)
 }
 
 func loadPreludeModules(ctx *C.JSContext) {
 	C.js_std_add_helpers(ctx, 0, (**C.char)(unsafe.Pointer(nil)))
+	// C.JS_AddIntrinsicProxy(ctx)
 
 	stdStr := "std\x00"
 	var cstr *C.char
@@ -218,7 +209,7 @@ func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interf
 		return
 	}
 
-	r, e := ctx.callFunc(v, args...)
+	r, e := callFunc(c, v, args...)
 	if e != nil {
 		err = e
 		return
@@ -254,7 +245,7 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 		err = fmt.Errorf("var %s is not with type function", funcName)
 		return
 	}
-	ctx.bindFunc(v, funcVarPtr)
+	bindFunc(c, v, funcVarPtr)
 	return
 }
 
