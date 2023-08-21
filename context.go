@@ -239,7 +239,7 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 		err = fmt.Errorf("var %s is not with type function", funcName)
 		return
 	}
-	bindFunc(c, v, funcVarPtr)
+	bindFunc(c, ctx.global, funcName, funcVarPtr)
 	return
 }
 

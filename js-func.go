@@ -10,18 +10,21 @@ import (
 	"unsafe"
 )
 
-func bindFunc(ctx *C.JSContext, jsFunc C.JSValue, funcVarPtr interface{}) (err error) {
+func bindFunc(ctx *C.JSContext, global C.JSValue, funcName string, funcVarPtr interface{}) (err error) {
 	helper, e := elutils.NewEmbeddingFuncHelper(funcVarPtr)
 	if e != nil {
 		err = e
 		return
 	}
-	helper.BindEmbeddingFunc(wrapFunc(ctx, jsFunc, helper))
+	helper.BindEmbeddingFunc(wrapFunc(ctx, global, funcName, helper))
 	return
 }
 
-func wrapFunc(ctx *C.JSContext, jsFunc C.JSValue, helper *elutils.EmbeddingFuncHelper) elutils.FnGoFunc {
+func wrapFunc(ctx *C.JSContext, global C.JSValue, funcName string, helper *elutils.EmbeddingFuncHelper) elutils.FnGoFunc {
 	return func(args []reflect.Value) (results []reflect.Value) {
+		// reload the function when calling go-function
+		jsFunc, _ := getVar(ctx, global, funcName)
+		defer C.JS_FreeValue(ctx, jsFunc)
 		return callJsFuncFromGo(ctx, jsFunc, helper, args)
 	}
 }
