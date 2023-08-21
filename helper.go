@@ -24,7 +24,7 @@ func InitCache() {
 	jsCtxCache = make(map[string]*jsCtx)
 }
 
-func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext, err error) {
+func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext, existing bool, err error) {
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -56,6 +56,7 @@ func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext
 		jsC.jsvm = ctx
 		jsC.mt = mt
 	} else {
+		existing = true
 		ctx = jsC.jsvm
 	}
 	return
