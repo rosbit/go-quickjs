@@ -62,15 +62,12 @@ func freeJsContext(ctx *JsContext) {
 
 func freeContext(ctx *C.JSContext) {
 	rt := C.JS_GetRuntime(ctx)
-	// C.js_std_free_handlers(rt)
 	C.JS_FreeContext(ctx)
+	// C.js_std_free_handlers(rt)
 	C.JS_FreeRuntime(rt)
 }
 
 func loadPreludeModules(ctx *C.JSContext) {
-	C.js_std_add_helpers(ctx, 0, (**C.char)(unsafe.Pointer(nil)))
-	// C.JS_AddIntrinsicProxy(ctx)
-
 	stdStr := "std\x00"
 	var cstr *C.char
 	getStrPtr(&stdStr, &cstr)
@@ -79,6 +76,9 @@ func loadPreludeModules(ctx *C.JSContext) {
 	osStr := "os\x00"
 	getStrPtr(&osStr, &cstr)
 	C.js_init_module_os(ctx, cstr)
+
+	C.js_std_add_helpers(ctx, -1, (**C.char)(unsafe.Pointer(nil)))
+	// C.JS_AddIntrinsicProxy(ctx)
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
@@ -208,6 +208,8 @@ func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interf
 		err = e
 		return
 	}
+	defer C.JS_FreeValue(c, r)
+
 	res, err = fromJsValue(c, r)
 	return
 }

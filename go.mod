@@ -2,6 +2,6 @@ module github.com/rosbit/go-quickjs
 
 go 1.18
 
-require github.com/rosbit/go-embedding-utils v0.1.0 // indirect
+require github.com/rosbit/go-embedding-utils v0.4.1
 
-replace github.com/rosbit/go-embedding-utils => ../go-embedding-utils/
+// replace github.com/rosbit/go-embedding-utils => ../go-embedding-utils/

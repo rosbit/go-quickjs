@@ -1,11 +1,12 @@
 package quickjs
 
 import (
-	"sync"
-	"os"
-	"time"
+	// "sync"
+	// "os"
+	// "time"
 )
 
+/*
 type jsCtx struct {
 	jsvm *JsContext
 	mt   time.Time
@@ -14,17 +15,20 @@ type jsCtx struct {
 var (
 	jsCtxCache map[string]*jsCtx
 	lock *sync.Mutex
-)
+)*/
 
 func InitCache() {
+	/*
 	if lock != nil {
 		return
 	}
 	lock = &sync.Mutex{}
 	jsCtxCache = make(map[string]*jsCtx)
+	*/
 }
 
 func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext, existing bool, err error) {
+	/*
 	lock.Lock()
 	defer lock.Unlock()
 
@@ -59,6 +63,9 @@ func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *JsContext
 		existing = true
 		ctx = jsC.jsvm
 	}
+	return
+	*/
+	ctx, err = createJSContext(path, vars)
 	return
 }
 
