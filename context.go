@@ -43,7 +43,7 @@ func NewContext() (*JsContext, error) {
 }
 
 func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
-	// C.js_std_init_handlers(rt)
+	C.js_std_init_handlers(rt)
 	ctx := C.JS_NewContext(rt)
 	if ctx == (*C.JSContext)(unsafe.Pointer(nil)) {
 		return ctx
@@ -63,7 +63,7 @@ func freeJsContext(ctx *JsContext) {
 func freeContext(ctx *C.JSContext) {
 	rt := C.JS_GetRuntime(ctx)
 	C.JS_FreeContext(ctx)
-	// C.js_std_free_handlers(rt)
+	C.js_std_free_handlers(rt)
 	C.JS_FreeRuntime(rt)
 }
 

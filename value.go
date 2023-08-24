@@ -10,6 +10,7 @@ import "C"
 import (
 	"unsafe"
 	"fmt"
+	"math"
 )
 
 func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
@@ -23,6 +24,10 @@ func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 		goVal = C.JS_ToBool(ctx, jsVal) != 0
 		return
 	case C.JS_IsNumber(jsVal) != 0:
+		if C.JS_VALUE_IS_NAN(jsVal) != 0 {
+			goVal = math.NaN()
+			return
+		}
 		var f C.double
 		C.JS_ToFloat64(ctx, &f, jsVal)
 		goVal = float64(f)

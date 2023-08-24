@@ -23,23 +23,22 @@ static JSClassDef go_obj_handler_def = {
 	.exotic = &go_obj_handler_exotic_methods,
 };
 
-static int createGoObjClass(JSRuntime *rt, JSClassID *classId, const char *handlerName, JSClassDef *classDef) {
+static JSClassID goObjClassId = 0;
+
+static int createGoObjClass(JSRuntime *rt, const char *handlerName, JSClassDef *classDef) {
 	int ret;
 
 	classDef->class_name = handlerName;
-	JS_NewClassID(classId);
-	ret = JS_NewClass(rt, *classId, classDef);
+	JS_NewClassID(&goObjClassId);
+	ret = JS_NewClass(rt, goObjClassId, classDef);
 	if (ret != 0) {
 		return ret;
 	}
-	void *o = (void*)(*(uint64_t*)(classId));
-	JS_SetRuntimeOpaque(rt, o);
 	return 0;
 }
 
 int registerGoObjectClass(JSRuntime *rt, const char *objHandlerName) {
-	static JSClassID classId = 0;
-	return createGoObjClass(rt, &classId, objHandlerName, &go_obj_handler_def);
+	return createGoObjClass(rt, objHandlerName, &go_obj_handler_def);
 }
 
 typedef struct {
@@ -47,19 +46,8 @@ typedef struct {
 	uint32_t   idx;
 } goOpaque;
 
-JSClassID getGoObjClassId(JSRuntime *rt) {
-	void *o = JS_GetRuntimeOpaque(rt);
-	if (o == NULL) {
-		return 0;
-	}
-	uint64_t l = (uint64_t)o;
-	JSClassID classId = *((JSClassID*)(&l));
-	return classId;
-}
-
-JSClassID getGoObjClassId2(JSContext *ctx) {
-	JSRuntime *rt = JS_GetRuntime(ctx);
-	return getGoObjClassId(rt);
+JSClassID getGoObjClassId() {
+	return goObjClassId;
 }
 
 void setGoObjOpaque(JSContext *ctx, JSValue val, uint32_t idx) {
@@ -72,16 +60,16 @@ void setGoObjOpaque(JSContext *ctx, JSValue val, uint32_t idx) {
 	JS_SetOpaque(val, o);
 }
 
-void freeGoObjOpaque(JSValue val, JSClassID classId) {
-	goOpaque *o = (goOpaque*)JS_GetOpaque(val, classId);
+void freeGoObjOpaque(JSValue val) {
+	goOpaque *o = (goOpaque*)JS_GetOpaque(val, goObjClassId);
 	if (o == NULL) {
 		return;
 	}
 	free(o);
 }
 
-int getGoObjOpaque(JSValue val, JSClassID classId, uint32_t *idx, JSContext **ctx) {
-	goOpaque *o = (goOpaque*)JS_GetOpaque(val, classId);
+int getGoObjOpaque(JSValue val, uint32_t *idx, JSContext **ctx) {
+	goOpaque *o = (goOpaque*)JS_GetOpaque(val, goObjClassId);
 	if (o == NULL) {
 		return 0;
 	}

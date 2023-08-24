@@ -2,11 +2,10 @@ package quickjs
 
 // #include "quickjs.h"
 // int registerGoObjectClass(JSRuntime *rt, const char *objHandlerName);
-// JSClassID getGoObjClassId(JSRuntime *rt);
-// JSClassID getGoObjClassId2(JSContext *ctx);
+// JSClassID getGoObjClassId();
 // void setGoObjOpaque(JSContext *ctx, JSValue val, uint32_t idx);
-// void freeGoObjOpaque(JSValue val, JSClassID classId);
-// int getGoObjOpaque(JSValue val, JSClassID classId, uint32_t *idx, JSContext **ctx);
+// void freeGoObjOpaque(JSValue val);
+// int getGoObjOpaque(JSValue val, uint32_t *idx, JSContext **ctx);
 import "C"
 import (
 	elutils "github.com/rosbit/go-embedding-utils"
@@ -48,7 +47,8 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 		}
 		return C.JS_NewFloat64(ctx, C.double(float64(vU64))), nil
 	case reflect.Float32, reflect.Float64:
-		return	C.JS_NewFloat64(ctx, C.double(vv.Float())), nil
+		fv := vv.Float()
+		return	C.JS_NewFloat64(ctx, C.double(fv)), nil
 	case reflect.String:
 		return makeString(ctx, v.(string)), nil
 	case reflect.Slice:
@@ -204,9 +204,8 @@ func go_struct_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSVal
 }
 
 func getTargetIdx(ctx *C.JSContext, obj C.JSValueConst) (idx uint32) {
-	classId := C.getGoObjClassId2(ctx)
 	var cIdx C.uint32_t
-	if C.getGoObjOpaque(obj, classId, &cIdx, (**C.JSContext)(unsafe.Pointer(nil))) != 0 {
+	if C.getGoObjOpaque(obj, &cIdx, (**C.JSContext)(unsafe.Pointer(nil))) != 0 {
 		idx = uint32(cIdx)
 	}
 	return
@@ -305,13 +304,12 @@ func goObjSet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, value C.JSVal
 //export freeGoTarget
 func freeGoTarget(rt *C.JSRuntime, val C.JSValue) {
 	// fmt.Printf("--- freeGoTarget called\n")
-	classId := C.getGoObjClassId(rt)
 	var idx C.uint32_t
 	var ctx *C.JSContext
-	if C.getGoObjOpaque(val, classId, &idx, &ctx) != 0 {
+	if C.getGoObjOpaque(val, &idx, &ctx) != 0 {
 		ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
 		ptr.remove(uint32(idx))
-		C.freeGoObjOpaque(val, classId)
+		C.freeGoObjOpaque(val)
 	}
 	C.JS_FreeValueRT(rt, val)
 }
@@ -327,7 +325,7 @@ func registerGoObjectClass(rt *C.JSRuntime) error {
 }
 
 func makeGoObject(ctx *C.JSContext, v interface{}) C.JSValue {
-	classId := C.getGoObjClassId2(ctx)
+	classId := C.getGoObjClassId()
 	goObj := C.JS_NewObjectProtoClass(ctx, C.JS_NULL, classId)
 	if C.JS_IsException(goObj) != 0 {
 		return goObj
