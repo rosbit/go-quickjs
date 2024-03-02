@@ -82,9 +82,9 @@ func loadPreludeModules(ctx *C.JSContext) {
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
-	var cstr *C.char
-	var length C.int
-	getStrPtrLen(&script, &cstr, &length)
+	cstr := C.CString(script)
+	length := len(script)
+	defer C.free(unsafe.Pointer(cstr))
 
 	return ctx.eval(cstr, C.size_t(length), noname, env)
 }
