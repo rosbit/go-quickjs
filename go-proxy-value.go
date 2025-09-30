@@ -1,11 +1,10 @@
 package quickjs
 
+// #include "go-proxy.h"
 // #include "quickjs.h"
-// int registerGoObjectClass(JSRuntime *rt, const char *objHandlerName);
-// JSClassID getGoObjClassId();
-// void setGoObjOpaque(JSContext *ctx, JSValue val, uint32_t idx);
-// void freeGoObjOpaque(JSValue val);
-// int getGoObjOpaque(JSValue val, uint32_t *idx, JSContext **ctx);
+// JSValue makeGoObject(JSContext *ctx, uint32_t idx);
+// void goFreeId(JSContext *ctx, uint32_t idx);
+// int restoreGoObjIdx(JSValue val, uint32_t *idx, JSContext **ctx);
 import "C"
 import (
 	elutils "github.com/rosbit/go-embedding-utils"
@@ -15,22 +14,19 @@ import (
 	"strconv"
 	"strings"
 )
-var (
-	goObjHandler  = "GoObjHandler\x00"
-)
 
 func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 	if v == nil {
-		return C.JS_NULL, nil
+		return C.toNull(), nil
 	}
 
 	vv := reflect.ValueOf(v)
 	switch vv.Kind() {
 	case reflect.Bool:
 		if v.(bool) {
-			return C.JS_TRUE, nil
+			return C.toTrue(), nil
 		} else {
-			return C.JS_FALSE, nil
+			return C.toFalse(), nil
 		}
 	case reflect.Int8, reflect.Int16, reflect.Int32:
 		return C.JS_NewInt32(ctx, C.int32_t(int32(vv.Int()))), nil
@@ -57,7 +53,7 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 			return makeBytes(ctx, v.([]byte)), nil
 		}
 		fallthrough
-	case reflect.Array, reflect.Map, reflect.Struct:
+	case reflect.Array, reflect.Map, reflect.Struct, reflect.Interface:
 		return makeGoObject(ctx, v), nil
 	case reflect.Ptr:
 		if vv.Elem().Kind() == reflect.Struct {
@@ -67,7 +63,7 @@ func makeJsValue(ctx *C.JSContext, v interface{}) (C.JSValue, error) {
 	case reflect.Func:
 		return bindGoFunc(ctx, v), nil
 	default:
-		return C.JS_UNDEFINED, fmt.Errorf("unsupported type %v", vv.Kind())
+		return C.toUndefined(), fmt.Errorf("unsupported type %v", vv.Kind())
 	}
 }
 
@@ -78,16 +74,16 @@ func go_arr_get(ctx *C.JSContext, vv reflect.Value, key string) C.JSValue {
 	}
 	idx, err := strconv.Atoi(key)
 	if err != nil {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 
 	l := vv.Len()
 	if idx < 0 || idx >= l {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	val := vv.Index(idx)
 	if !val.IsValid() || !val.CanInterface() {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	v, _ := makeJsValue(ctx, val.Interface())
 	return v
@@ -116,7 +112,7 @@ func go_arr_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSValueC
 func go_map_get(ctx *C.JSContext, vv reflect.Value, key string) C.JSValue {
 	val := vv.MapIndex(reflect.ValueOf(key))
 	if !val.IsValid() || !val.CanInterface() {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	v, _ := makeJsValue(ctx, val.Interface())
 	return v
@@ -144,11 +140,11 @@ func go_struct_get(ctx *C.JSContext, structVar reflect.Value, key string) C.JSVa
 		structE = structVar
 	case reflect.Ptr:
 		if structVar.Elem().Kind() != reflect.Struct {
-			return C.JS_UNDEFINED
+			return C.toUndefined()
 		}
 		structE = structVar.Elem()
 	default:
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	name := upperFirst(key)
 	fv := structE.FieldByName(name)
@@ -156,20 +152,20 @@ func go_struct_get(ctx *C.JSContext, structVar reflect.Value, key string) C.JSVa
 		fv = structE.MethodByName(name)
 		if !fv.IsValid() {
 			if structE == structVar {
-				return C.JS_UNDEFINED
+				return C.toUndefined()
 			}
 			fv = structVar.MethodByName(name)
 			if !fv.IsValid() {
-				return C.JS_UNDEFINED
+				return C.toUndefined()
 			}
 		}
 		if fv.CanInterface() {
 			return bindGoFunc(ctx, fv.Interface())
 		}
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	if !fv.CanInterface() {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	v, _ := makeJsValue(ctx, fv.Interface())
 	return v
@@ -203,9 +199,18 @@ func go_struct_set(ctx *C.JSContext, vv reflect.Value, key string, value C.JSVal
 	return 1
 }
 
+func go_interface_get(ctx *C.JSContext, vv reflect.Value, key string) C.JSValue {
+	name := upperFirst(key)
+	fv := vv.MethodByName(name)
+	if !fv.IsValid() || !fv.CanInterface() {
+		return C.toUndefined()
+	}
+	return bindGoFunc(ctx, fv.Interface())
+}
+
 func getTargetIdx(ctx *C.JSContext, obj C.JSValueConst) (idx uint32) {
 	var cIdx C.uint32_t
-	if C.getGoObjOpaque(obj, &cIdx, (**C.JSContext)(unsafe.Pointer(nil))) != 0 {
+	if C.restoreGoObjIdx(obj, &cIdx, (**C.JSContext)(unsafe.Pointer(nil))) != 0 {
 		idx = uint32(cIdx)
 	}
 	return
@@ -253,14 +258,14 @@ func goObjGet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, receiver C.JS
 	// fmt.Printf("--- getTargetValue called\n")
 	v, ok := getTargetValue(ctx, obj)
 	if !ok {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	if v == nil {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	key := getKeyName(ctx, atom)
 	if len(key) == 0 {
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 	switch vv := reflect.ValueOf(v); vv.Kind() {
 	case reflect.Slice, reflect.Array:
@@ -269,8 +274,10 @@ func goObjGet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, receiver C.JS
 		return go_map_get(ctx, vv, key)
 	case reflect.Struct, reflect.Ptr:
 		return go_struct_get(ctx, vv, key)
+	case reflect.Interface:
+		return go_interface_get(ctx, vv, key)
 	default:
-		return C.JS_UNDEFINED
+		return C.toUndefined()
 	}
 }
 
@@ -301,40 +308,16 @@ func goObjSet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, value C.JSVal
 	}
 }
 
-//export freeGoTarget
-func freeGoTarget(rt *C.JSRuntime, val C.JSValue) {
-	// fmt.Printf("--- freeGoTarget called\n")
-	var idx C.uint32_t
-	var ctx *C.JSContext
-	if C.getGoObjOpaque(val, &idx, &ctx) != 0 {
-		ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
-		ptr.remove(uint32(idx))
-		C.freeGoObjOpaque(val)
-	}
-	C.JS_FreeValueRT(rt, val)
-}
-
-func registerGoObjectClass(rt *C.JSRuntime) error {
-	var objHandlerName *C.char
-
-	getStrPtr(&goObjHandler, &objHandlerName)
-	if C.registerGoObjectClass(rt, objHandlerName) == 0 {
-		return nil
-	}
-	return fmt.Errorf("failed to call JS_NewClass")
+//export goFreeId
+func goFreeId(ctx *C.JSContext, idx C.uint32_t) {
+	ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
+	ptr.remove(uint32(idx))
 }
 
 func makeGoObject(ctx *C.JSContext, v interface{}) C.JSValue {
-	classId := C.getGoObjClassId()
-	goObj := C.JS_NewObjectProtoClass(ctx, C.JS_NULL, classId)
-	if C.JS_IsException(goObj) != 0 {
-		return goObj
-	}
-
 	ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
 	idx := ptr.register(&v)
-	C.setGoObjOpaque(ctx, goObj, C.uint32_t(idx))
-	return goObj
+	return C.makeGoObject(ctx, C.uint32_t(idx))
 }
 
 func upperFirst(name string) string {

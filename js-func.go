@@ -1,86 +1,112 @@
 package quickjs
 
 /*
-#include "quickjs-libc.h"
+#include "go-proxy.h"
+#include <stdlib.h>
+
+static void setJsArgs(JSValue *jsArgs, int i, JSValue arg) {
+	jsArgs[i] = arg;
+}
+static void setJsArgsUndefined(JSValue *jsArgs, int i) {
+	jsArgs[i] = JS_UNDEFINED;
+}
+
+static JSValue* allocJsArgs(int size) {
+	return (JSValue*)malloc(sizeof(JSValue)*size);
+}
+static void freeJsArgs(JSContext *ctx, JSValue *jsArgs, int size) {
+	int i;
+
+	if (jsArgs == NULL) {
+		return;
+	}
+	for (i=0; i<size; i++) {
+		JS_FreeValue(ctx, jsArgs[i]);
+	}
+	free(jsArgs);
+}
 */
 import "C"
 import (
 	elutils "github.com/rosbit/go-embedding-utils"
 	"reflect"
-	"unsafe"
+	// "unsafe"
+	// "fmt"
 )
 
-func bindFunc(ctx *C.JSContext, global C.JSValue, funcName string, funcVarPtr interface{}) (err error) {
+func bindFunc(ctx *JsContext, funcName string, funcVarPtr interface{}) (err error) {
 	helper, e := elutils.NewEmbeddingFuncHelper(funcVarPtr)
 	if e != nil {
 		err = e
 		return
 	}
-	helper.BindEmbeddingFunc(wrapFunc(ctx, global, funcName, helper))
+	helper.BindEmbeddingFunc(wrapFunc(ctx, funcName, helper))
 	return
 }
 
-func wrapFunc(ctx *C.JSContext, global C.JSValue, funcName string, helper *elutils.EmbeddingFuncHelper) elutils.FnGoFunc {
+func wrapFunc(ctx *JsContext, funcName string, helper *elutils.EmbeddingFuncHelper) elutils.FnGoFunc {
 	return func(args []reflect.Value) (results []reflect.Value) {
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+
 		// reload the function when calling go-function
-		jsFunc, _ := getVar(ctx, global, funcName)
-		defer C.JS_FreeValue(ctx, jsFunc)
-		return callJsFuncFromGo(ctx, jsFunc, helper, args)
+		jsFunc, _ := ctx.getVar(funcName)
+		defer C.JS_FreeValue(ctx.c, jsFunc)
+		return callJsFuncFromGo(ctx.c, jsFunc, helper, args)
 	}
 }
 
 // called by wrapFunc() and fromJsFunc::bindGoFunc()
 func callJsFuncFromGo(ctx *C.JSContext, jsFunc C.JSValue, helper *elutils.EmbeddingFuncHelper, args []reflect.Value)  (results []reflect.Value) {
-	var jsArgs []C.JSValue
+	argc := C.int(len(args))
 
-	// make js args
-	itArgs := helper.MakeGoFuncArgs(args)
-	for arg := range itArgs {
-		jsVal, err := makeJsValue(ctx, arg)
-		if err != nil {
-			jsArgs = append(jsArgs, C.JS_UNDEFINED)
-		} else {
-			jsArgs = append(jsArgs, jsVal)
+	var jsArgs *C.JSValue
+	if argc > 0 {
+		jsArgs = C.allocJsArgs(argc)
+		// make js args
+		itArgs := helper.MakeGoFuncArgs(args)
+		i := 0
+		for arg := range itArgs {
+			jsVal, err := makeJsValue(ctx, arg)
+			if err != nil {
+				C.setJsArgsUndefined(jsArgs, C.int(i))
+			} else {
+				C.setJsArgs(jsArgs, C.int(i), jsVal)
+			}
+			i += 1
 		}
+
 	}
 
 	// call JS function
-	argc := C.int(len(jsArgs))
-	var argv *C.JSValue
-	if argc > 0 {
-		argv = &jsArgs[0]
-	}
-	jsRes := C.JS_Call(ctx, jsFunc, jsFunc, argc, argv)
-	for _, jsArg := range jsArgs {
-		C.JS_FreeValue(ctx, jsArg)
-	}
+	jsRes := C.JS_Call(ctx, jsFunc, C.toUndefined(), argc, jsArgs)
+	C.freeJsArgs(ctx, jsArgs, argc)
 
 	// convert result to golang
 	goVal, err := fromJsValue(ctx, jsRes)
+	// fmt.Printf("goVal: %v, err: %v\n", goVal, err)
 	results = helper.ToGolangResults(goVal, C.JS_IsArray(ctx, jsRes) != 0, err)
 	C.JS_FreeValue(ctx, jsRes)
 	return
 }
 
 func callFunc(ctx *C.JSContext, fn C.JSValue, args ...interface{}) (res C.JSValue, err error) {
-	l := len(args)
-	jsArgs := make([]C.JSValue, l)
+	l := C.int(len(args))
+	var jsArgs *C.JSValue
+	if l > 0 {
+		jsArgs = C.allocJsArgs(l)
+	}
+
 	for i, arg := range args {
 		if jsVal, e := makeJsValue(ctx, arg); e != nil {
-			jsArgs[i] = C.JS_UNDEFINED
+			C.setJsArgsUndefined(jsArgs, C.int(i))
 		} else {
-			jsArgs[i] = jsVal
+			C.setJsArgs(jsArgs, C.int(i), jsVal)
 		}
 	}
 
-	if l == 0 {
-		res = C.JS_Call(ctx, fn, fn, 0, (*C.JSValue)(unsafe.Pointer(nil)))
-	} else {
-		res = C.JS_Call(ctx, fn, fn, C.int(l), &jsArgs[0])
-	}
-	for _, jsArg := range jsArgs {
-		C.JS_FreeValue(ctx, jsArg)
-	}
+	res = C.JS_Call(ctx, fn, fn, l, jsArgs)
+	C.freeJsArgs(ctx, jsArgs, l)
 	return
 }
 

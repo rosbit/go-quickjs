@@ -5,6 +5,9 @@ package quickjs
 static JSAtom getAtom(struct JSPropertyEnum *atom, int i) {
 	return atom[i].atom;
 }
+static int jsValueGetTag(JSValueConst v) {
+	return JS_VALUE_GET_TAG(v);
+}
 */
 import "C"
 import (
@@ -13,6 +16,7 @@ import (
 	"math"
 )
 
+// 把JS的值转成golang的值，不释放jsVal的空间
 func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
 	switch {
 	case C.JS_IsException(jsVal) != 0:
@@ -27,6 +31,13 @@ func fromJsValue(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 		if C.JS_VALUE_IS_NAN(jsVal) != 0 {
 			goVal = math.NaN()
 			return
+		}
+		if C.jsValueGetTag(jsVal) == C.JS_TAG_INT {
+			var i C.int64_t
+			if C.JS_ToInt64(ctx, &i, jsVal) == 0 {
+				goVal = int64(i)
+				return
+			}
 		}
 		var f C.double
 		C.JS_ToFloat64(ctx, &f, jsVal)
@@ -66,15 +77,7 @@ func makeBytes(ctx *C.JSContext, b []byte) C.JSValue {
 }
 
 func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
-	var isGoObj bool
-	if goVal, isGoObj = getTargetValue(ctx, jsVal); isGoObj {
-		return
-	}
-
-	length := "length\x00"
-	var arrLength *C.char
-	getStrPtr(&length, &arrLength)
-	arrLen := C.JS_GetPropertyStr(ctx, jsVal, arrLength)
+	arrLen := getPropertyStr(ctx, jsVal, "length\x00")
 	defer C.JS_FreeValue(ctx, arrLen)
 
 	var l int
@@ -92,6 +95,7 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 		eJsV := C.JS_GetPropertyUint32(ctx, jsVal, C.uint32_t(i))
 		if C.JS_IsException(eJsV) != 0 {
 			err = fromJsException(ctx)
+			C.JS_FreeValue(ctx, eJsV)
 			// err = fmt.Errorf("exception when get %d element of array\n", i)
 			return
 		}
@@ -108,11 +112,6 @@ func fromJsArray(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err erro
 }
 
 func fromJsObject(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err error) {
-	var isGoObj bool
-	if goVal, isGoObj = getTargetValue(ctx, jsVal); isGoObj {
-		return
-	}
-
 	var tab_atom *C.JSPropertyEnum
 	var tab_atom_count C.uint32_t
 	if C.JS_GetOwnPropertyNames(ctx, &tab_atom, &tab_atom_count, jsVal, C.JS_GPN_STRING_MASK | C.JS_GPN_SYMBOL_MASK | C.JS_GPN_ENUM_ONLY) == -1 {
@@ -128,6 +127,7 @@ func fromJsObject(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err err
 	for i:=0; i<count; i++ {
 		a := C.getAtom(tab_atom, C.int(i))
 		eJsV := C.JS_GetProperty(ctx, jsVal, a)
+		C.JS_FreeAtom(ctx, a)
 		ev, e := fromJsValue(ctx, eJsV)
 		C.JS_FreeValue(ctx, eJsV)
 		if e != nil {
@@ -138,11 +138,12 @@ func fromJsObject(ctx *C.JSContext, jsVal C.JSValue) (goVal interface{}, err err
 		res[C.GoString(cstrKey)] = ev
 		C.JS_FreeCString(ctx, cstrKey)
 	}
-freeAtoms:
+	/*
 	for i:=0; i<count; i++ {
 		a := C.getAtom(tab_atom, C.int(i))
 		C.JS_FreeAtom(ctx, a)
-	}
+	}*/
+freeAtoms:
 	C.js_free(ctx, unsafe.Pointer(tab_atom))
 	goVal = res
 	return
@@ -155,28 +156,38 @@ func getPropertyStr(ctx *C.JSContext, jsVal C.JSValue, czStr string) C.JSValue {
 }
 
 func getExceptionStr(ctx *C.JSContext, exVal C.JSValue) string {
-	str := C.JS_ToCString(ctx, exVal)
+	name := getPropertyStr(ctx, exVal, "name\x00")
+	defer C.JS_FreeValue(ctx, name)
+	str := C.JS_ToCString(ctx, name)
 	if str == (*C.char)(unsafe.Pointer(nil)) {
-		return "[exception]"
+		return ""
 	}
+
 	defer C.JS_FreeCString(ctx, str)
 	return C.GoString(str)
 }
 
+func dumpException(ctx *C.JSContext, exVal C.JSValue) {
+	stack := getPropertyStr(ctx, exVal, "stack\x00")
+	defer C.JS_FreeValue(ctx, stack)
+	if C.JS_IsUndefined(stack) == 0 && C.JS_IsNull(stack) == 0 {
+		s := C.JS_ToCString(ctx, stack)
+		if s != (*C.char)(unsafe.Pointer(nil)) {
+			println("Stack trace", C.GoString(s))
+			C.JS_FreeCString(ctx, s)
+		}
+	}
+}
+
 func fromJsException(ctx *C.JSContext) (err error) {
 	exVal := C.JS_GetException(ctx)
+	if C.JS_IsError(ctx, exVal) == 0 {
+		return nil
+	}
 	defer C.JS_FreeValue(ctx, exVal)
 
+	dumpException(ctx, exVal)
 	exceptionStr := getExceptionStr(ctx, exVal)
-	if C.JS_IsError(ctx, exVal) == 0 {
-		err = fmt.Errorf("%s", exceptionStr)
-		return
-	}
-	val := getPropertyStr(ctx, exVal, "stack\x00")
-	defer C.JS_FreeValue(ctx, val)
-
-	if C.JS_IsUndefined(val) == 0 {
-		err = fmt.Errorf("%s\n%s", exceptionStr, getExceptionStr(ctx, val))
-	}
+	err = fmt.Errorf("%s", exceptionStr)
 	return
 }

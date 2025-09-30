@@ -1,7 +1,9 @@
 package quickjs
 
 /*
-#include "quickjs-libc.h"
+#include "go-proxy.h"
+#include "quickjs.h"
+
 static JSValueConst getArg(JSValueConst *argv, int i) {
 	return argv[i];
 }
@@ -31,16 +33,16 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	ptr := getPtrStore(uintptr(unsafe.Pointer(ctx)))
 	fnPtr, ok := ptr.lookup(idx)
 	if !ok {
-		return C.JS_UNDEFINED
+		return C.toException()
 	}
 	fnVarPtr, ok := fnPtr.(*interface{})
 	if !ok {
-		return C.JS_UNDEFINED
+		return C.toException()
 	}
 	fn := *fnVarPtr
 	fnVal := reflect.ValueOf(fn)
 	if fnVal.Kind() != reflect.Func {
-		return C.JS_UNDEFINED
+		return C.toException()
 	}
 	fnType := fnVal.Type()
 
@@ -59,7 +61,7 @@ func goFuncBridge(ctx *C.JSContext, this_val C.JSValueConst, argc C.int, argv *C
 	}
 
 	if v == nil {
-		return C.JS_UNDEFINED
+		return C.toException()
 	}
 
 	jsVal, err := makeJsValue(ctx, v)

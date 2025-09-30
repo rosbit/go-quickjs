@@ -5,39 +5,62 @@ package quickjs
 static int getValTag(JSValueConst v) {
 	return JS_VALUE_GET_TAG(v);
 }
+int registerGoObjectClass(JSRuntime *rt);
 */
 import "C"
 import (
 	"reflect"
 	"unsafe"
 	"fmt"
+	"sync"
 	"runtime"
 )
 
 const noname = ""
 
+var (
+	globalMu = &sync.Mutex{}
+)
+
+type JsRuntime struct {
+	rt *C.JSRuntime
+}
+
 type JsContext struct {
+	rt *JsRuntime
 	c *C.JSContext
-	global C.JSValue
+	mu *sync.Mutex
 }
 
 func NewContext() (*JsContext, error) {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
 	rt := C.JS_NewRuntime()
 	if rt == (*C.JSRuntime)(unsafe.Pointer(nil)) {
-		return nil, fmt.Errorf("failed to create Runtime")
+		return nil, fmt.Errorf("failed to init quickjs runtime")
 	}
-	// ctx := C.JS_NewContext(rt)
+	if ret := C.registerGoObjectClass(rt); ret != 0 {
+		C.JS_FreeRuntime(rt)
+		return nil, fmt.Errorf("failed to registerGoObjectClass");
+	}
+
 	ctx := createCustomerContext(rt)
 	if ctx == (*C.JSContext)(unsafe.Pointer(nil)) {
 		C.JS_FreeRuntime(rt)
 		return nil, fmt.Errorf("failed to create context")
 	}
+
+	r := &JsRuntime {
+		rt: rt,
+	}
+	runtime.SetFinalizer(r, freeJsRuntime)
 	loadPreludeModules(ctx)
 	c := &JsContext {
+		rt: r,
 		c: ctx,
-		global: C.JS_GetGlobalObject(ctx),
+		mu: &sync.Mutex{},
 	}
-	registerGoObjectClass(rt)
 	runtime.SetFinalizer(c, freeJsContext)
 	return c, nil
 }
@@ -52,19 +75,17 @@ func createCustomerContext(rt *C.JSRuntime) *C.JSContext {
 	return ctx
 }
 
-func freeJsContext(ctx *JsContext) {
-	// fmt.Printf("context freed\n")
-	c := ctx.c
-	delPtrStore((uintptr(unsafe.Pointer(c))))
-	C.JS_FreeValue(c, ctx.global)
-	freeContext(c)
+func freeJsRuntime(rt *JsRuntime) {
+	r := rt.rt
+	C.JS_FreeRuntime(r)
 }
 
-func freeContext(ctx *C.JSContext) {
-	rt := C.JS_GetRuntime(ctx)
-	C.JS_FreeContext(ctx)
-	C.js_std_free_handlers(rt)
-	C.JS_FreeRuntime(rt)
+func freeJsContext(ctx *JsContext) {
+	fmt.Printf("--- context freed\n")
+	c := ctx.c
+	delPtrStore((uintptr(unsafe.Pointer(c))))
+
+	C.JS_FreeContext(c)
 }
 
 func loadPreludeModules(ctx *C.JSContext) {
@@ -78,10 +99,12 @@ func loadPreludeModules(ctx *C.JSContext) {
 	C.js_init_module_os(ctx, cstr)
 
 	C.js_std_add_helpers(ctx, -1, (**C.char)(unsafe.Pointer(nil)))
-	// C.JS_AddIntrinsicProxy(ctx)
 }
 
 func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res interface{}, err error) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	cstr := C.CString(script)
 	length := len(script)
 	defer C.free(unsafe.Pointer(cstr))
@@ -90,6 +113,9 @@ func (ctx *JsContext) Eval(script string, env map[string]interface{}) (res inter
 }
 
 func (ctx *JsContext) EvalFile(scriptFile string, env map[string]interface{}) (res interface{}, err error) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	var scriptClen C.size_t
 
 	scriptFileCstr := C.CString(scriptFile)
@@ -118,23 +144,27 @@ func (ctx *JsContext) eval(scriptCstr *C.char, scriptClen C.size_t, filename str
 	if isModule {
 		jsVal = C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, C.JS_EVAL_TYPE_MODULE | C.JS_EVAL_FLAG_COMPILE_ONLY)
 		if C.JS_IsException(jsVal) == 0 {
-			if C.getValTag(jsVal) == C.JS_TAG_MODULE {
-				C.js_module_set_import_meta(c, jsVal, 1, 1)
-				jsVal = C.JS_EvalFunction(c, jsVal)
-				goto EXIT
-			}
+			C.js_module_set_import_meta(c, jsVal, 1, 1)
+			jsVal = C.JS_EvalFunction(c, jsVal)
 		}
+		jsVal = C.js_std_await(c, jsVal);
 	} else {
-		jsVal = C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, 0)
+		jsVal = C.JS_Eval(c, scriptCstr, scriptClen, scriptFileCstr, C.JS_EVAL_TYPE_GLOBAL)
 	}
-	res, err = fromJsValue(c, jsVal)
-EXIT:
+	if (C.JS_IsException(jsVal) != 0) {
+		C.js_std_dump_error(c);
+		err = fmt.Errorf("exception thrown")
+	} else {
+		res, err = fromJsValue(c, jsVal)
+	}
 	C.JS_FreeValue(c, jsVal)
 	return
 }
 
 func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
 	c := ctx.c
+	global := C.JS_GetGlobalObject(c);
+	defer C.JS_FreeValue(c, global)
 
 	var jsVal C.JSValue
 	for k, _ := range env {
@@ -148,8 +178,9 @@ func (ctx *JsContext) setEnv(env map[string]interface{}) (err error) {
 		}
 
 		cstr := C.CString(k)
-		C.JS_SetPropertyStr(c, ctx.global, cstr, jsVal)
+		C.JS_SetPropertyStr(c, global, cstr, jsVal)
 		C.free(unsafe.Pointer(cstr))
+		// C.JS_FreeValue(c, jsVal)
 	}
 	return
 }
@@ -158,17 +189,18 @@ func getVar(c *C.JSContext, global C.JSValue, name string) (v C.JSValue, err err
 	cstr := C.CString(name)
 	v = C.JS_GetPropertyStr(c, global, cstr)
 	C.free(unsafe.Pointer(cstr))
-	if v == C.JS_EXCEPTION {
-		err = fmt.Errorf("no var named %s found", name)
-		return
+	if C.JS_IsException(v) != 0 {
+		err = fromJsException(c)
 	}
 	return
 }
 
 func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	c := ctx.c
 
-	// r, e := getVar(c, ctx.global, name)
 	r, e := ctx.getVar(name)
 	if e != nil {
 		err = e
@@ -181,17 +213,18 @@ func (ctx *JsContext) GetGlobal(name string) (res interface{}, err error) {
 }
 
 func (ctx *JsContext) getVar(name string) (C.JSValue, error) {
-	/*
-	if C.getValTag(ctx.m) == C.JS_TAG_MODULE {
-		return getVar(ctx.c, ctx.m, name)
-	}*/
-	return getVar(ctx.c, ctx.global, name)
+	c := ctx.c
+	global := C.JS_GetGlobalObject(c);
+	defer C.JS_FreeValue(c, global)
+	return getVar(ctx.c, global, name)
 }
 
 func (ctx *JsContext) CallFunc(funcName string, args ...interface{}) (res interface{}, err error) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	c := ctx.c
 
-	// v, e := getVar(c, ctx.global, funcName)
 	v, e := ctx.getVar(funcName)
 	if e != nil {
 		err = e
@@ -228,9 +261,11 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 		return
 	}
 
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	c := ctx.c
 
-	// v, e := getVar(c, ctx.global, funcName)
 	v, e := ctx.getVar(funcName)
 	if e != nil {
 		err = e
@@ -241,7 +276,7 @@ func (ctx *JsContext) BindFunc(funcName string, funcVarPtr interface{}) (err err
 		err = fmt.Errorf("var %s is not with type function", funcName)
 		return
 	}
-	bindFunc(c, ctx.global, funcName, funcVarPtr)
+	bindFunc(ctx, funcName, funcVarPtr)
 	return
 }
 
