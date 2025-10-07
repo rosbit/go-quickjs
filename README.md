@@ -102,7 +102,10 @@ as Javascript global function by calling `EvalFile` by registering. There's the 
 ```go
 package main
 
-import "github.com/rosbit/go-quickjs"
+import (
+    "github.com/rosbit/go-quickjs"
+    "fmt"
+)
 
 // function to be called by Javascript
 func adder(a1 float64, a2 float64) float64 {
