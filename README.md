@@ -83,12 +83,12 @@ func main() {
   }
   res := add(1, 2)
 
-  // method 2: call JS function using Call
-  res, err := ctx.CallFunc("add", 1, 2)
-  if err != nil {
-     fmt.Printf("%v\n", err)
-     return
-  }
+  // method 2: call JS function using CallFunc
+  // res, err := ctx.CallFunc("add", 1, 2)
+  // if err != nil {
+  //   fmt.Printf("%v\n", err)
+  //   return
+  // }
 
   fmt.Println("result is:", res)
 }
@@ -117,8 +117,10 @@ func main() {
   }
 
   if _, err := ctx.EvalFile("b.js", map[string]interface{}{
-      "adder": adder,
-  })  // b.js containing code calling "adder"
+      "adder": adder,  // b.js containing code calling "adder"
+  }); err != nil {
+      fmt.Printf("%v\n", err)
+  }
 }
 ```
 
