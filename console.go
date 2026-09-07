@@ -60,6 +60,10 @@ func installBuiltins(c *Context) {
 		C.JS_FreeValue(c.c, printFn)
 	}
 	C.JS_FreeValue(c.c, global)
+
+	if c.rt.require {
+		installRequire(c)
+	}
 }
 
 func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {

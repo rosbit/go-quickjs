@@ -759,3 +759,220 @@ func TestFileCacheWithScriptHome(t *testing.T) {
 		t.Fatal("ClearCache should close every cached context")
 	}
 }
+
+// CommonJS require: relative modules, json, node_modules, caching
+func TestRequire(t *testing.T) {
+	dir := t.TempDir()
+	write := func(p, s string) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// a module exporting a function, itself requiring a sibling
+	write(filepath.Join(dir, "lib", "inner.js"), "module.exports = (x) => x + 1;\n")
+	write(filepath.Join(dir, "lib", "outer.js"),
+		"const inner = require('./inner');\n"+
+			"exports.bump = (x) => inner(x) * 10;\n"+
+			"exports.dir = __dirname;\n")
+	// json
+	write(filepath.Join(dir, "cfg", "conf.json"), `{"name":"demo","n":3}`+"\n")
+	// a node_modules package resolved through package.json "main"
+	write(filepath.Join(dir, "node_modules", "mypkg", "package.json"), `{"name":"mypkg","main":"dist/main.js"}`+"\n")
+	write(filepath.Join(dir, "node_modules", "mypkg", "dist", "main.js"),
+		"exports.hello = () => 'hi from mypkg';\n")
+	// a bare package without package.json -> index.js
+	write(filepath.Join(dir, "node_modules", "plain", "index.js"), "module.exports = 42;\n")
+
+	main := filepath.Join(dir, "main.js")
+	write(main, `
+const outer = require('./lib/outer');
+const conf = require('./cfg/conf.json');
+const mypkg = require('mypkg');
+const plain = require('plain');
+globalThis.run = () => outer.bump(2) + '|' + conf.name + '|' + mypkg.hello() + '|' + plain;
+globalThis.runDir = () => outer.dir;
+globalThis.counted = () => { const c = require('./counter'); return c.next(); };
+`)
+	write(filepath.Join(dir, "counter.js"),
+		"let n = 0;\nexports.next = () => ++n;\n")
+
+	ctx, err := qjs.New(qjs.WithRequire())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(main); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ctx.Call("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "30|demo|hi from mypkg|42" {
+		t.Fatalf("require: %#v", got)
+	}
+
+	// __dirname points at the module, not at the entry file
+	dirGot, err := ctx.Call("runDir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if real := filepath.Join(dir, "lib"); dirGot != real {
+		t.Fatalf("__dirname: %v (want %v)", dirGot, real)
+	}
+
+	// modules are cached: the counter keeps its state
+	for i := 1; i <= 3; i++ {
+		v, err := ctx.Call("counted")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != int64(i) && v != float64(i) {
+			t.Fatalf("cache: call %d -> %#v", i, v)
+		}
+	}
+}
+
+// a bare require can be satisfied by WithModulePaths, like NODE_PATH
+func TestRequireSearchPath(t *testing.T) {
+	dir := t.TempDir()
+	lib := filepath.Join(dir, "vendor")
+	write := func(p, s string) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(lib, "shared.js"), "module.exports = { tag: 'shared' };\n")
+	main := filepath.Join(dir, "main.js")
+	write(main, "const s = require('shared');\nglobalThis.run = () => s.tag;\n")
+
+	ctx, err := qjs.New(qjs.WithRequire(), qjs.WithModulePaths(lib))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(main); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := ctx.Call("run"); err != nil || v != "shared" {
+		t.Fatalf("shared: %v, %v", v, err)
+	}
+}
+
+// a missing module fails with the name javascript asked for
+func TestRequireNotFound(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "main.js")
+	if err := os.WriteFile(main, []byte("require('nope-not-here');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := qjs.New(qjs.WithRequire())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(main); err == nil {
+		t.Fatal("expected the missing require to fail")
+	} else if !strings.Contains(err.Error(), "nope-not-here") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// require is not installed unless asked for
+func TestRequireDisabledByDefault(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	v, err := ctx.Eval("typeof require")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := v.String(); s != "undefined" {
+		t.Fatalf("require should be absent, got typeof = %q", s)
+	}
+}
+
+// the cache can enable require() through LoadFileFromCacheWith
+func TestFileCacheWithRequire(t *testing.T) {
+	dir := t.TempDir()
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(dir, "lib.js"), "module.exports = (x) => x * 3;\n")
+	main := filepath.Join(dir, "main.js")
+	write(main, "const f = require('./lib');\nglobalThis.run = (x) => f(x);\n")
+
+	opts := []qjs.Option{qjs.WithRequire()}
+	ctx, existing, err := qjs.LoadFileFromCacheWith(main, nil, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("first load should not be cached")
+	}
+	if v, err := ctx.Call("run", 5); err != nil || v != int64(15) && v != float64(15) {
+		t.Fatalf("run: %v, %v", v, err)
+	}
+
+	// a second call must reuse the context: WithRequire() called twice yields
+	// the same option identity
+	ctx2, existing, err := qjs.LoadFileFromCacheWith(main, nil, []qjs.Option{qjs.WithRequire()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existing || ctx2 != ctx {
+		t.Fatalf("second load should reuse the context (existing=%v)", existing)
+	}
+
+	qjs.ClearCache()
+}
+
+// require() is on by default for the cache entry points
+func TestFileCacheHasRequire(t *testing.T) {
+	dir := t.TempDir()
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(dir, "lib.js"), "module.exports = { tag: 'lib' };\n")
+	main := filepath.Join(dir, "main.js")
+	write(main, "const lib = require('./lib');\nglobalThis.run = () => lib.tag;\n")
+
+	ctx, _, err := qjs.LoadFileFromCache(main, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := ctx.Eval("typeof require"); err != nil || v.String() != "function" {
+		t.Fatalf("typeof require: %v, %v", v, err)
+	}
+	if v, err := ctx.Call("run"); err != nil || v != "lib" {
+		t.Fatalf("run: %v, %v", v, err)
+	}
+
+	// LoadFileFromCacheWith keeps require even when other options are passed
+	ctx2, existing, err := qjs.LoadFileFromCacheWith(main, nil, []qjs.Option{qjs.WithMemoryLimit(1 << 20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("extra options make a different cache entry")
+	}
+	if v, err := ctx2.Call("run"); err != nil || v != "lib" {
+		t.Fatalf("run with options: %v, %v", v, err)
+	}
+
+	qjs.ClearCache()
+}

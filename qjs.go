@@ -71,6 +71,7 @@ type Runtime struct {
 	funcs       *funcStore
 	loader      ModuleLoader
 	modulePaths []string
+	require     bool
 	stdout      io.Writer
 	stderr      io.Writer
 	closed      bool
@@ -96,6 +97,7 @@ type options struct {
 	maxStackSize uint32
 	loader       ModuleLoader
 	modulePaths  []string
+	require      bool
 	stdout       io.Writer
 	stderr       io.Writer
 }
@@ -130,6 +132,22 @@ func WithModuleLoader(l ModuleLoader) Option { return func(o *options) { o.loade
 func WithModulePaths(paths ...string) Option {
 	return func(o *options) { o.modulePaths = append(o.modulePaths, paths...) }
 }
+
+// WithRequire installs a CommonJS require() in the global object, so that
+// javascript can load node-style modules instead of (or next to) ES modules.
+//
+//	const {f} = require("./lib");        // relative to the requiring file
+//	const pkg = require("mypkg");        // node_modules, walking up the tree
+//	const cfg = require("./config.json") // .json files are parsed
+//
+// A bare name is looked up in every node_modules directory from the requiring
+// file up to the filesystem root, then in the directories set by
+// WithModulePaths; package.json "main" is honoured, "index.js" is the default.
+// Modules are cached by resolved path, so they run once and circular requires
+// see partially filled exports, like in node.
+//
+// It is disabled by default: enabling it adds the require() global.
+func WithRequire() Option { return func(o *options) { o.require = true } }
 
 // WithConsoleWriter redirects console.log / console.error output.
 func WithConsoleWriter(stdout, stderr io.Writer) Option {
@@ -178,6 +196,7 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 		funcs:       newFuncStore(),
 		loader:      o.loader,
 		modulePaths: o.modulePaths,
+		require:     o.require,
 		stdout:      o.stdout,
 		stderr:      o.stderr,
 	}
