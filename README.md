@@ -28,16 +28,21 @@ import (
 )
 
 func main() {
-  ctx, err := quickjs.NewContext()
+  ctx, err := quickjs.New()
   if err != nil {
     fmt.Printf("%v\n", err)
     return
   }
 
-  res, _ := ctx.Eval("a + b", map[string]interface{}{
+  if err = ctx.SetAll(map[string]interface{}{
      "a": 10,
      "b": 1,
-  })
+  }); err != nil {
+    fmt.Printf("%v\n", err)
+    return
+  }
+
+  res, _ := ctx.Eval("a + b")
   fmt.Println("result is:", res)
 }
 ```
@@ -65,19 +70,19 @@ import (
 var add func(int, int)int
 
 func main() {
-  ctx, err := quickjs.NewContext()
+  ctx, err := quickjs.New()
   if err != nil {
      fmt.Printf("%v\n", err)
      return
   }
 
-  if _, err := ctx.EvalFile("a.js", nil); err != nil {
+  if _, err = ctx.EvalFile("a.js"); err != nil {
      fmt.Printf("%v\n", err)
      return
   }
 
   // method 1: bind JS function with a golang var
-  if err := ctx.BindFunc("add", &add); err != nil {
+  if err = ctx.BindFunc("add", &add); err != nil {
      fmt.Printf("%v\n", err)
      return
   }
@@ -113,15 +118,19 @@ func adder(a1 float64, a2 float64) float64 {
 }
 
 func main() {
-  ctx, err := quickjs.NewContext()
+  ctx, err := quickjs.New()
   if err != nil {
       fmt.Printf("%v\n", err)
       return
   }
 
-  if _, err := ctx.EvalFile("b.js", map[string]interface{}{
+  if err = ctx.SetAll(map[string]interface{}{
       "adder": adder,  // b.js containing code calling "adder"
   }); err != nil {
+      fmt.Printf("%v\n", err)
+  }
+
+  if _, err = ctx.EvalFile("b.js"); err != nil {
       fmt.Printf("%v\n", err)
   }
 }
