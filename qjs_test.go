@@ -612,3 +612,150 @@ func TestFileCache(t *testing.T) {
 		t.Fatal("ClearCache should close cached contexts")
 	}
 }
+
+// import resolution follows a PATH-like list of directories
+func TestModuleSearchPath(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "app")
+	libDir := filepath.Join(dir, "libs")
+	pkgDir := filepath.Join(libDir, "pkg")
+	for _, d := range []string{appDir, pkgDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(libDir, "mylib.js"), "export function twice(x){return x*2}\n")
+	write(filepath.Join(pkgDir, "inner.js"), "export function add(x){return x+x}\n")
+	write(filepath.Join(pkgDir, "index.js"), "import {add} from './inner.js';\nexport function quad(x){return add(add(x))}\n")
+	write(filepath.Join(appDir, "main.js"), ""+
+		"import {twice} from 'mylib';\n"+
+		"import {quad} from 'pkg';\n"+
+		"globalThis.run = (x) => twice(x) + quad(x);\n")
+
+	ctx, err := qjs.New(qjs.WithModulePaths(libDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(filepath.Join(appDir, "main.js")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ctx.Call("run", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != int64(18) && res != float64(18) {
+		t.Fatalf("search path: %#v (want 18)", res)
+	}
+}
+
+// a script imports files sitting next to it without any configuration
+func TestModuleNextToEntry(t *testing.T) {
+	dir := t.TempDir()
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(dir, "helper.js"), "export const v = 7\n")
+	write(filepath.Join(dir, "main.js"), "import {v} from 'helper';\nglobalThis.run = () => v;\n")
+
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(filepath.Join(dir, "main.js")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ctx.Call("run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != int64(7) && res != float64(7) {
+		t.Fatalf("next to entry: %#v (want 7)", res)
+	}
+}
+
+// without a matching search path the import fails with a clear error
+func TestModuleNotFound(t *testing.T) {
+	dir := t.TempDir()
+	app := filepath.Join(dir, "main.js")
+	if err := os.WriteFile(app, []byte("import {v} from 'nowhere';\nglobalThis.run = () => v;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+	if _, err := ctx.EvalFile(app); err == nil {
+		t.Fatal("expected the missing import to fail")
+	} else if !strings.Contains(err.Error(), "nowhere") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// LoadFileFromCache passes scriptHome down as module search paths
+func TestFileCacheWithScriptHome(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "app")
+	libDir := filepath.Join(dir, "libs")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(libDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(libDir, "mylib.js"), "export function twice(x){return x*2}\n")
+	main := filepath.Join(appDir, "main.js")
+	write(main, "import {twice} from 'mylib';\nglobalThis.run = (x) => twice(x);\n")
+
+	ctx, existing, err := qjs.LoadFileFromCache(main, nil, libDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("first load should not be cached")
+	}
+	if v, err := ctx.Call("run", 21); err != nil || v != int64(42) && v != float64(42) {
+		t.Fatalf("run: %v, %v", v, err)
+	}
+
+	// same file + same script home -> reused
+	ctx2, existing, err := qjs.LoadFileFromCache(main, nil, libDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existing || ctx2 != ctx {
+		t.Fatalf("second load should reuse the context (existing=%v)", existing)
+	}
+
+	// same file but different search paths -> a different cache entry; here the
+	// import cannot be resolved at all, which proves the paths are not reused
+	ctx3, existing, err := qjs.LoadFileFromCache(main, nil)
+	if err == nil {
+		t.Fatal("without the script home the bare import should fail")
+	}
+	if ctx3 != nil || existing {
+		t.Fatalf("failed load must not return a context (ctx=%v, existing=%v)", ctx3, existing)
+	}
+	if ctx.Closed() {
+		t.Fatal("a failed reload must not drop the working cached context")
+	}
+
+	qjs.ClearCache()
+	if !ctx.Closed() || !ctx3.Closed() {
+		t.Fatal("ClearCache should close every cached context")
+	}
+}

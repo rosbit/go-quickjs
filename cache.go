@@ -2,6 +2,7 @@ package quickjs
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,9 +34,16 @@ func InitCache() {
 // see them. The returned existing flag tells whether the context came from
 // the cache (false means the file was loaded or reloaded this time).
 //
+// scriptHome is a list of directories holding importable javascript packages.
+// They are passed to the context as module search paths, so the file (and
+// everything it imports) can do `import {f} from "mylib"` without knowing
+// where mylib.js actually lives -- the same role PATH plays for a shell. The
+// directory of path itself is always searched first, so a script can import
+// files sitting next to it without any configuration.
+//
 // The context is shared: goroutines may call it concurrently, calls are
 // serialized internally.
-func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *Context, existing bool, err error) {
+func LoadFileFromCache(path string, vars map[string]interface{}, scriptHome ...string) (ctx *Context, existing bool, err error) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 
@@ -48,24 +56,29 @@ func LoadFileFromCache(path string, vars map[string]interface{}) (ctx *Context, 
 		return nil, false, statErr
 	}
 
-	if ce, ok := fileCache[path]; ok {
+	// the search paths change what "import" resolves to, so they belong to
+	// the cache key: the same file loaded with different script homes must
+	// not share a context.
+	key := cacheKey(path, scriptHome)
+
+	if ce, ok := fileCache[key]; ok {
 		if ce.mt.Equal(fi.ModTime()) {
 			if ce.ctx.Closed() {
-				delete(fileCache, path) // someone closed it behind our back; reload
+				delete(fileCache, key) // someone closed it behind our back; reload
 			} else {
 				return ce.ctx, true, nil
 			}
 		} else {
 			ce.ctx.Close() // stale file: drop the old context before reloading
-			delete(fileCache, path)
+			delete(fileCache, key)
 		}
 	}
 
-	ctx, err = newContextFromFile(path, vars)
+	ctx, err = newContextFromFile(path, vars, scriptHome)
 	if err != nil {
 		return nil, false, err
 	}
-	fileCache[path] = &cachedFile{ctx: ctx, mt: fi.ModTime()}
+	fileCache[key] = &cachedFile{ctx: ctx, mt: fi.ModTime()}
 	return ctx, false, nil
 }
 
@@ -79,8 +92,17 @@ func ClearCache() {
 	}
 }
 
-func newContextFromFile(path string, vars map[string]interface{}) (*Context, error) {
-	ctx, err := New()
+// cacheKey builds the map key: the file path plus the search paths that were
+// used to resolve its imports. "\x00" cannot appear in a path.
+func cacheKey(path string, scriptHome []string) string {
+	if len(scriptHome) == 0 {
+		return path
+	}
+	return path + "\x00" + strings.Join(scriptHome, "\x00")
+}
+
+func newContextFromFile(path string, vars map[string]interface{}, scriptHome []string) (*Context, error) {
+	ctx, err := New(WithModulePaths(scriptHome...))
 	if err != nil {
 		return nil, err
 	}

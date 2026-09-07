@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -64,15 +65,16 @@ type ModuleLoader func(name string) ([]byte, error)
 
 // Runtime wraps a quickjs JSRuntime. A Runtime may host several Contexts.
 type Runtime struct {
-	rt       *C.JSRuntime
-	mu       sync.Mutex
-	ctxs     map[*Context]struct{}
-	funcs    *funcStore
-	loader   ModuleLoader
-	stdout   io.Writer
-	stderr   io.Writer
-	closed   bool
-	lastFunc uint32
+	rt          *C.JSRuntime
+	mu          sync.Mutex
+	ctxs        map[*Context]struct{}
+	funcs       *funcStore
+	loader      ModuleLoader
+	modulePaths []string
+	stdout      io.Writer
+	stderr      io.Writer
+	closed      bool
+	lastFunc    uint32
 }
 
 // Context wraps a quickjs JSContext.
@@ -82,6 +84,10 @@ type Context struct {
 	lock   reentrant
 	values map[*Value]struct{}
 	closed bool
+
+	// module resolution state, only touched while an Eval/Call holds the lock
+	mainDir string // directory of the file given to EvalFile/RunFile
+	modDir  string // directory of the module loaded most recently
 }
 
 type options struct {
@@ -89,6 +95,7 @@ type options struct {
 	gcThreshold  uint32
 	maxStackSize uint32
 	loader       ModuleLoader
+	modulePaths  []string
 	stdout       io.Writer
 	stderr       io.Writer
 }
@@ -105,9 +112,24 @@ func WithGCThreshold(n uint32) Option { return func(o *options) { o.gcThreshold 
 // WithMaxStackSize sets the maximum JS stack size, in bytes.
 func WithMaxStackSize(n uint32) Option { return func(o *options) { o.maxStackSize = n } }
 
-// WithModuleLoader replaces the default module loader (which reads files from
-// disk) by a custom one. It is used by `import` statements.
+// WithModuleLoader replaces the default module loader by a custom one. It is
+// used by `import` statements. Setting a custom loader disables the search
+// path resolution done by WithModulePaths: the loader receives the raw module
+// name and is fully responsible for turning it into source code.
 func WithModuleLoader(l ModuleLoader) Option { return func(o *options) { o.loader = l } }
+
+// WithModulePaths sets the directories searched when javascript code imports a
+// module, in the same spirit as the PATH environment variable of a shell.
+//
+// A bare `import "mylib"` is looked up in every directory of paths, in order,
+// trying "mylib", "mylib.js", "mylib.mjs" and "mylib/index.js". The directory
+// of the file passed to EvalFile/RunFile is always searched first, so a
+// script can import files sitting next to it without any configuration.
+//
+// It has no effect when WithModuleLoader is used.
+func WithModulePaths(paths ...string) Option {
+	return func(o *options) { o.modulePaths = append(o.modulePaths, paths...) }
+}
 
 // WithConsoleWriter redirects console.log / console.error output.
 func WithConsoleWriter(stdout, stderr io.Writer) Option {
@@ -126,7 +148,6 @@ func New(opts ...Option) (*Context, error) {
 // NewRuntime creates a quickjs runtime.
 func NewRuntime(opts ...Option) (*Runtime, error) {
 	o := &options{
-		loader: ReadFile,
 		stdout: os.Stdout,
 		stderr: os.Stderr,
 	}
@@ -152,12 +173,13 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 	}
 
 	r := &Runtime{
-		rt:     rt,
-		ctxs:   make(map[*Context]struct{}),
-		funcs:  newFuncStore(),
-		loader: o.loader,
-		stdout: o.stdout,
-		stderr: o.stderr,
+		rt:          rt,
+		ctxs:        make(map[*Context]struct{}),
+		funcs:       newFuncStore(),
+		loader:      o.loader,
+		modulePaths: o.modulePaths,
+		stdout:      o.stdout,
+		stderr:      o.stderr,
 	}
 	// the only finalizer of the whole design: it closes every still opened
 	// context first, then frees the runtime.
@@ -276,8 +298,12 @@ func (c *Context) Close() error {
 	return nil
 }
 
-// Closed reports whether the context has been closed.
+// Closed reports whether the context has been closed. A nil context counts as
+// closed, so callers can check the result of a failed load without a nil test.
 func (c *Context) Closed() bool {
+	if c == nil {
+		return true
+	}
 	c.lock.lock()
 	defer c.lock.unlock()
 	return c.closed
@@ -317,6 +343,8 @@ func (c *Context) EvalFile(path string) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	// imports of this file resolve relative to its own directory first
+	c.mainDir, c.modDir = filepath.Dir(path), filepath.Dir(path)
 	asModule := C.qjs_is_module(cstrPtr(buf), C.size_t(len(buf))) != 0
 	return c.evalBytes(buf, path, EvalGlobal, asModule)
 }
