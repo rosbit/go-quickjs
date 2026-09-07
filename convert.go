@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+	"unicode"
 	"unsafe"
 )
 
@@ -207,7 +208,7 @@ func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, erro
 		if f.PkgPath != "" { // unexported
 			continue
 		}
-		name := fieldName(f)
+		name, fromTag := fieldName(f)
 		if name == "" {
 			continue
 		}
@@ -222,6 +223,11 @@ func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, erro
 		if ret < 0 {
 			C.JS_FreeValue(c.c, obj)
 			return C.qjs_undefined(), errSetProp
+		}
+		if !fromTag {
+			// also expose the field under the javascript convention, so that
+			// a.Name is reachable as a.name
+			setAlias(c, obj, name, ev)
 		}
 	}
 	if withMethods {
@@ -263,11 +269,31 @@ func bindMethods(c *Context, obj C.JSValue, pv reflect.Value) error {
 		if ret < 0 {
 			return errSetProp
 		}
+		// a.Greet() is reachable as a.greet() too
+		setAlias(c, obj, m.Name, fv)
 	}
 	return nil
 }
 
-func fieldName(f reflect.StructField) string {
+// setAlias exposes val a second time, under the lower-camel form of name. The
+// object already owns the reference handed to qjs_set_prop, so the value is
+// duplicated first; the duplicate is consumed by this second call.
+func setAlias(c *Context, obj C.JSValue, name string, val C.JSValue) {
+	alias := lowerCamel(name)
+	if alias == name {
+		return
+	}
+	C.JS_DupValue(c.c, val)
+	ckey := C.CString(alias)
+	C.qjs_set_prop(c.c, obj, ckey, val) // consumes the duplicate
+	C.free(unsafe.Pointer(ckey))
+}
+
+// fieldName returns the name a struct field is exposed under in javascript --
+// the json tag when there is one, the Go field name otherwise -- and whether
+// the name came from the tag. An explicit tag means the author chose the name,
+// so no lower-camel alias is derived from it.
+func fieldName(f reflect.StructField) (string, bool) {
 	tag, ok := f.Tag.Lookup("json")
 	if ok {
 		name := tag
@@ -280,13 +306,42 @@ func fieldName(f reflect.StructField) string {
 			}
 		}
 		if name == "-" {
-			return ""
+			return "", true
 		}
 		if name != "" {
-			return name
+			return name, true
 		}
 	}
-	return f.Name
+	return f.Name, false
+}
+
+// lowerCamel turns an exported Go name into the javascript convention:
+// Name -> name, UserName -> userName, HTTPStatus -> httpStatus, ID -> id.
+// A name that does not start with an upper-case letter is returned untouched.
+func lowerCamel(s string) string {
+	if s == "" {
+		return s
+	}
+	rs := []rune(s)
+	k := 0
+	for k < len(rs) && unicode.IsUpper(rs[k]) {
+		k++
+	}
+	switch {
+	case k == 0:
+		return s
+	case k == len(rs): // ID -> id
+		for i := range rs {
+			rs[i] = unicode.ToLower(rs[i])
+		}
+	case k > 1: // HTTPStatus -> httpStatus
+		for i := 0; i < k-1; i++ {
+			rs[i] = unicode.ToLower(rs[i])
+		}
+	default: // Name -> name
+		rs[0] = unicode.ToLower(rs[0])
+	}
+	return string(rs)
 }
 
 func newJSString(c *Context, s string) C.JSValue {
@@ -503,7 +558,7 @@ func jsToStruct(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, err
 		if f.PkgPath != "" {
 			continue
 		}
-		name := fieldName(f)
+		name, fromTag := fieldName(f)
 		if name == "" {
 			continue
 		}
@@ -513,6 +568,17 @@ func jsToStruct(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, err
 		if C.JS_IsException(e) != 0 {
 			C.JS_FreeValue(c.c, e)
 			return reflect.Value{}, c.takeError()
+		}
+		if C.qjs_is_undefined(e) != 0 && !fromTag {
+			// javascript spelled the field in lower camel: a.name fills Name
+			C.JS_FreeValue(c.c, e)
+			calias := C.CString(lowerCamel(name))
+			e = C.qjs_get_prop(c.c, jsVal, calias)
+			C.free(unsafe.Pointer(calias))
+			if C.JS_IsException(e) != 0 {
+				C.JS_FreeValue(c.c, e)
+				return reflect.Value{}, c.takeError()
+			}
 		}
 		if C.qjs_is_undefined(e) != 0 {
 			C.JS_FreeValue(c.c, e)

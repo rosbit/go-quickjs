@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -975,4 +976,87 @@ func TestFileCacheHasRequire(t *testing.T) {
 	}
 
 	qjs.ClearCache()
+}
+
+// exported fields and methods are also reachable in lower camel, a.Name -> a.name
+func TestLowerCamelNames(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	if err := ctx.Set("a", &struct {
+		Name       string
+		UserAge    int
+		ID         int
+		HTTPStatus int
+		Nick       string `json:"nickname"`
+	}{Name: "gopher", UserAge: 3, ID: 7, HTTPStatus: 200, Nick: "gg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for js, want := range map[string]string{
+		`a.name`:         "gopher",
+		`a.Name`:         "gopher", // the go name keeps working
+		`a.userAge`:      "3",
+		`a.id`:           "7",
+		`a.httpStatus`:   "200",
+		`a.nickname`:     "gg", // the json tag is used as is
+		`typeof a.nick`:  "undefined",
+		`typeof a.name2`: "undefined",
+	} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != want {
+			t.Fatalf("%s = %q, want %q", js, got, want)
+		}
+	}
+
+	// methods get the same treatment
+	if err := ctx.Set("b", &person{Name: "gopher"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, js := range []string{`b.Greet("hi")`, `b.greet("hi")`} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != "hi gopher" {
+			t.Fatalf("%s = %q", js, got)
+		}
+	}
+}
+
+// a javascript object spelled in lower camel fills the go struct
+func TestLowerCamelArgs(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	type person struct {
+		Name    string
+		UserAge int
+	}
+	if err := ctx.Set("describe", func(p person) string {
+		return p.Name + ":" + strconv.Itoa(p.UserAge)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, js := range []string{
+		`describe({name: "bob", userAge: 30})`,
+		`describe({Name: "bob", UserAge: 30})`, // go spelling still works
+	} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != "bob:30" {
+			t.Fatalf("%s = %q", js, got)
+		}
+	}
 }
