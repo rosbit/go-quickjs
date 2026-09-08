@@ -351,6 +351,15 @@ func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value)
 		if i == 0 && ft.NumIn() > 0 && ft.In(i) == typeContext {
 			continue
 		}
+		// reflect.MakeFunc hands the variadic portion over as a single slice
+		// value; spread its elements so javascript receives each one as an
+		// individual argument (fn(a, x, y...) must look like fn(a, x, y)).
+		if ft.IsVariadic() && i == len(args)-1 && a.IsValid() && a.Kind() == reflect.Slice {
+			for j := 0; j < a.Len(); j++ {
+				jsArgs = append(jsArgs, a.Index(j).Interface())
+			}
+			continue
+		}
 		if a.IsValid() && a.CanInterface() {
 			jsArgs = append(jsArgs, a.Interface())
 		} else {
