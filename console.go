@@ -16,6 +16,47 @@ import (
 	"unsafe"
 )
 
+// ANSI colors used by the console output (see also terminal conventions:
+// strings red, numbers yellow, objects cyan, functions blue).
+const (
+	cReset  = "\033[0m"
+	cRed    = "\033[31m"
+	cGreen  = "\033[32m"
+	cYellow = "\033[33m"
+	cBlue   = "\033[34m"
+	cCyan   = "\033[36m"
+	cGray   = "\033[90m"
+)
+
+// logColorEnabled tells the formatters whether to wrap leaf values in ANSI
+// colors. It is set at the start of each writeLine call, which always runs
+// under the global lock, so no extra synchronization is needed.
+var logColorEnabled bool
+
+// colorize wraps s in an ANSI color escape; containers stay uncolored so the
+// nested leaf colors remain readable.
+func colorize(color, s string) string {
+	if !logColorEnabled {
+		return s
+	}
+	return color + s + cReset
+}
+
+// isTerminalWriter reports whether w writes to a real terminal. Colors are
+// only emitted for terminals; redirected files, pipes and captured writers
+// keep clean plain text.
+func isTerminalWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // installBuiltins adds a minimal console object and a print() function, both
 // backed by golang, so that javascript code can log without pulling in the
 // whole quickjs-libc.
@@ -88,6 +129,8 @@ func writeLine(w io.Writer, args ...interface{}) {
 		fmt.Fprintln(w)
 		return
 	}
+	logColorEnabled = isTerminalWriter(w)
+	defer func() { logColorEnabled = false }()
 	parts := make([]string, 0, len(args))
 	for _, a := range args {
 		parts = append(parts, formatArg(a))
@@ -110,15 +153,15 @@ func formatArg(a interface{}) string {
 func formatValue(a interface{}, depth int) string {
 	switch v := a.(type) {
 	case nil:
-		return "undefined"
+		return colorize(cGray, "undefined")
 	case *Value:
 		return formatJsValue(v, depth)
 	case map[string]interface{}:
 		if len(v) == 0 {
-			return "{}"
+			return colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
-			return "{...}"
+			return colorize(cGray, "{...}")
 		}
 		keys := make([]string, 0, len(v))
 		for k := range v {
@@ -132,10 +175,10 @@ func formatValue(a interface{}, depth int) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	case []interface{}:
 		if len(v) == 0 {
-			return "[]"
+			return colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
-			return "[...]"
+			return colorize(cGray, "[...]")
 		}
 		parts := make([]string, 0, len(v))
 		for _, e := range v {
@@ -144,18 +187,18 @@ func formatValue(a interface{}, depth int) string {
 		return "[" + strings.Join(parts, ", ") + "]"
 	case bool:
 		if v {
-			return "true"
+			return colorize(cRed, "true")
 		}
-		return "false"
+		return colorize(cRed, "false")
 	case float64:
 		if v == float64(int64(v)) {
-			return fmt.Sprintf("%d", int64(v))
+			return colorize(cYellow, fmt.Sprintf("%d", int64(v)))
 		}
-		return fmt.Sprintf("%v", v)
+		return colorize(cYellow, fmt.Sprintf("%v", v))
 	case int64:
-		return fmt.Sprintf("%d", v)
+		return colorize(cYellow, fmt.Sprintf("%d", v))
 	case string:
-		return v
+		return colorize(cRed, v)
 	default:
 		return formatGoReflect(reflect.ValueOf(a), depth)
 	}
@@ -167,12 +210,12 @@ func formatValue(a interface{}, depth int) string {
 // though the proxy itself has no enumerable js properties.
 func formatGoReflect(rv reflect.Value, depth int) string {
 	if !rv.IsValid() {
-		return "undefined"
+		return colorize(cGray, "undefined")
 	}
 	switch rv.Kind() {
 	case reflect.Ptr, reflect.Interface:
 		if rv.IsNil() {
-			return "null"
+			return colorize(cGray, "null")
 		}
 		if rv.Kind() == reflect.Ptr && rv.Elem().Kind() == reflect.Struct {
 			// render through the pointer: its method set includes
@@ -182,13 +225,13 @@ func formatGoReflect(rv reflect.Value, depth int) string {
 		return formatGoReflect(rv.Elem(), depth)
 	case reflect.Map:
 		if rv.IsNil() {
-			return "null"
+			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return "{}"
+			return colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
-			return "{...}"
+			return colorize(cGray, "{...}")
 		}
 		keys := make([]string, 0, rv.Len())
 		values := make(map[string]reflect.Value, rv.Len())
@@ -206,13 +249,13 @@ func formatGoReflect(rv reflect.Value, depth int) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
-			return "null"
+			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return "[]"
+			return colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
-			return "[...]"
+			return colorize(cGray, "[...]")
 		}
 		parts := make([]string, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
@@ -223,15 +266,28 @@ func formatGoReflect(rv reflect.Value, depth int) string {
 		return formatGoStruct(rv, depth)
 	case reflect.Func:
 		if rv.IsNil() {
-			return "null"
+			return colorize(cGray, "null")
 		}
-		if name := goFuncName(rv); name != "" {
-			return "[Function: " + name + "]"
-		}
-		return "[Function]"
+		return colorize(cBlue, goReflectFuncName(rv))
+	case reflect.String:
+		return colorize(cRed, rv.String())
+	case reflect.Bool:
+		return colorize(cRed, fmt.Sprintf("%v", rv.Bool()))
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Uintptr, reflect.Float32, reflect.Float64:
+		return colorize(cYellow, fmt.Sprintf("%v", rv.Interface()))
 	default:
 		return fmt.Sprintf("%v", rv.Interface())
 	}
+}
+
+// goReflectFuncName renders a function value as [Function: Name].
+func goReflectFuncName(rv reflect.Value) string {
+	if name := goFuncName(rv); name != "" {
+		return "[Function: " + name + "]"
+	}
+	return "[Function]"
 }
 
 // formatGoStruct renders a struct -- or a pointer to one -- as {Field: v,
@@ -265,7 +321,7 @@ func formatGoStruct(rv reflect.Value, depth int) string {
 		parts = append(parts, m.Name+": [Function: "+m.Name+"]")
 	}
 	if len(parts) == 0 {
-		return "{}"
+		return colorize(cCyan, "{}")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -274,7 +330,7 @@ func formatGoStruct(rv reflect.Value, depth int) string {
 // objects by walking their enumerable properties.
 func formatJsValue(v *Value, depth int) string {
 	if v == nil || v.Freed() {
-		return "undefined"
+		return colorize(cGray, "undefined")
 	}
 	if v.IsFunction() {
 		name := ""
@@ -286,10 +342,7 @@ func formatJsValue(v *Value, depth int) string {
 			}
 			nv.Free()
 		}
-		if name != "" {
-			return "[Function: " + name + "]"
-		}
-		return "[Function]"
+		return colorize(cBlue, goJsFuncName(name))
 	}
 	if v.IsObject() && depth < maxLogDepth {
 		if m, err := v.Interface(); err == nil {
@@ -297,9 +350,19 @@ func formatJsValue(v *Value, depth int) string {
 		}
 	}
 	if s, err := v.JSON(); err == nil && s != "" {
-		return s
+		return colorize(cCyan, s)
+	}
+	if v.IsString() {
+		return colorize(cRed, v.String())
 	}
 	return v.String()
+}
+
+func goJsFuncName(name string) string {
+	if name != "" {
+		return "[Function: " + name + "]"
+	}
+	return "[Function]"
 }
 
 // releaseArgs frees the temporary *Value instances created while converting
