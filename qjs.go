@@ -30,6 +30,7 @@ package quickjs
 #cgo LDFLAGS: -lm
 #include <stdlib.h>
 #include "qjs-helper.h"
+#include "go-proxy.h"
 */
 import "C"
 
@@ -202,6 +203,7 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 		return nil, errors.New("qjs: failed to create quickjs runtime")
 	}
 	C.qjs_set_module_loader(rt)
+	C.registerGoObjectClass(rt)
 	if o.memoryLimit > 0 {
 		C.JS_SetMemoryLimit(rt, C.size_t(o.memoryLimit))
 	}
@@ -662,7 +664,7 @@ func (c *Context) Set(name string, v interface{}) error {
 	if c.closed {
 		return ErrClosed
 	}
-	jsVal, err := toJsValue(c, v, true)
+	jsVal, err := toJsValue(c, v)
 	if err != nil {
 		return err
 	}
@@ -759,7 +761,7 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 			C.qjs_set_value(jsArgs, C.int(i), C.qjs_undefined())
 		}
 		for i, arg := range args {
-			jv, err := toJsValue(c, arg, true)
+			jv, err := toJsValue(c, arg)
 			if err != nil {
 				jv = C.qjs_undefined()
 			}

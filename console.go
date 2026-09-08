@@ -157,8 +157,117 @@ func formatValue(a interface{}, depth int) string {
 	case string:
 		return v
 	default:
-		return fmt.Sprintf("%v", a)
+		return formatGoReflect(reflect.ValueOf(a), depth)
 	}
+}
+
+// formatGoReflect renders an arbitrary golang value for console.log: maps as
+// {k: v}, slices as [v, ...], structs by their exported fields, functions as
+// [Function: Name]. This is what makes a proxied golang value readable even
+// though the proxy itself has no enumerable js properties.
+func formatGoReflect(rv reflect.Value, depth int) string {
+	if !rv.IsValid() {
+		return "undefined"
+	}
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if rv.IsNil() {
+			return "null"
+		}
+		if rv.Kind() == reflect.Ptr && rv.Elem().Kind() == reflect.Struct {
+			// render through the pointer: its method set includes
+			// pointer-receiver methods
+			return formatGoStruct(rv, depth)
+		}
+		return formatGoReflect(rv.Elem(), depth)
+	case reflect.Map:
+		if rv.IsNil() {
+			return "null"
+		}
+		if rv.Len() == 0 {
+			return "{}"
+		}
+		if depth >= maxLogDepth {
+			return "{...}"
+		}
+		keys := make([]string, 0, rv.Len())
+		values := make(map[string]reflect.Value, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			k := fmt.Sprintf("%v", iter.Key().Interface())
+			keys = append(keys, k)
+			values[k] = iter.Value()
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+": "+formatGoReflect(values[k], depth+1))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice && rv.IsNil() {
+			return "null"
+		}
+		if rv.Len() == 0 {
+			return "[]"
+		}
+		if depth >= maxLogDepth {
+			return "[...]"
+		}
+		parts := make([]string, 0, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			parts = append(parts, formatGoReflect(rv.Index(i), depth+1))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case reflect.Struct:
+		return formatGoStruct(rv, depth)
+	case reflect.Func:
+		if rv.IsNil() {
+			return "null"
+		}
+		if name := goFuncName(rv); name != "" {
+			return "[Function: " + name + "]"
+		}
+		return "[Function]"
+	default:
+		return fmt.Sprintf("%v", rv.Interface())
+	}
+}
+
+// formatGoStruct renders a struct -- or a pointer to one -- as {Field: v,
+// Method: [Function: M]}: the exported fields first, then the exported
+// methods. Rendering through a pointer keeps pointer-receiver methods in the
+// method set.
+func formatGoStruct(rv reflect.Value, depth int) string {
+	if depth >= maxLogDepth {
+		return "{...}"
+	}
+	fields := rv
+	if rv.Kind() == reflect.Ptr {
+		fields = rv.Elem()
+	}
+	t := fields.Type()
+	parts := make([]string, 0, t.NumField()+rv.NumMethod())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
+		}
+		parts = append(parts, f.Name+": "+formatGoReflect(fields.Field(i), depth+1))
+	}
+	for i := 0; i < rv.NumMethod(); i++ {
+		m := rv.Type().Method(i)
+		if m.PkgPath != "" { // unexported
+			continue
+		}
+		// the name of a bound method value is reflect.methodValueCall; the
+		// meaningful name is the one in the method set
+		parts = append(parts, m.Name+": [Function: "+m.Name+"]")
+	}
+	if len(parts) == 0 {
+		return "{}"
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 // formatJsValue renders a raw js value: functions with their name, other

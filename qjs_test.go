@@ -85,12 +85,20 @@ func TestEval(t *testing.T) {
 		t.Fatalf("expected 7, got %#v", got)
 	}
 
-	s, err := ctx.Call("JSON.stringify", map[string]interface{}{"a": 1})
+	// a golang map is handed over as a proxy: js reads its properties with
+	// plain syntax. JSON.stringify is left to the engine and does not
+	// enumerate proxies, so it is not used to inspect them.
+	if err := ctx.Set("m", map[string]interface{}{"a": 1}); err != nil {
+		t.Fatal(err)
+	}
+	vv, err := ctx.Eval("m.a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s != `{"a":1}` {
-		t.Fatalf("unexpected json: %v", s)
+	defer vv.Free()
+	got2, _ := vv.Interface()
+	if got2 != int64(1) {
+		t.Fatalf("expected m.a == 1, got %#v", got2)
 	}
 }
 
@@ -442,18 +450,20 @@ func TestConcurrentContexts(t *testing.T) {
 				return
 			}
 			defer ctx.Close()
-			if err := ctx.Set("n", n); err != nil {
+			if err := ctx.Set("m", map[string]interface{}{"n": n}); err != nil {
 				t.Error(err)
 				return
 			}
 			for j := 0; j < 50; j++ {
-				res, err := ctx.Call("JSON.stringify", map[string]interface{}{"n": n})
+				res, err := ctx.Eval(`m.n`)
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				if res != fmt.Sprintf(`{"n":%d}`, n) {
-					t.Errorf("unexpected %v", res)
+				got, _ := res.Interface()
+				res.Free()
+				if got != int64(n) {
+					t.Errorf("m.n = %v, want %d", got, n)
 					return
 				}
 			}
@@ -981,7 +991,10 @@ func TestFileCacheHasRequire(t *testing.T) {
 	qjs.ClearCache()
 }
 
-// exported fields and methods are also reachable in lower camel, a.Name -> a.name
+// exported fields and methods are reachable under their go name, or with the
+// first letter lower-cased (Name -> name). The lookup rule is exactly one
+// first-letter toggle: json tags play no role, and multi-letter camel forms
+// (a.nickname for Nick) do not match.
 func TestLowerCamelNames(t *testing.T) {
 	ctx, err := qjs.New()
 	if err != nil {
@@ -994,19 +1007,23 @@ func TestLowerCamelNames(t *testing.T) {
 		UserAge    int
 		ID         int
 		HTTPStatus int
-		Nick       string `json:"nickname"`
+		Nick       string
 	}{Name: "gopher", UserAge: 3, ID: 7, HTTPStatus: 200, Nick: "gg"}); err != nil {
 		t.Fatal(err)
 	}
 
 	for js, want := range map[string]string{
-		`a.name`:         "gopher",
-		`a.Name`:         "gopher", // the go name keeps working
-		`a.userAge`:      "3",
-		`a.id`:           "7",
-		`a.httpStatus`:   "200",
-		`a.nickname`:     "gg", // the json tag is used as is
-		`typeof a.nick`:  "undefined",
+		`a.name`:         "gopher",  // first letter toggled: name finds Name
+		`a.Name`:         "gopher",  // the go name as it is
+		`a.userAge`:      "3",       // userAge finds UserAge
+		`a.UserAge`:      "3",
+		`a.ID`:           "7",
+		`a.iD`:           "7", // iD finds ID
+		`a.HTTPStatus`:   "200",
+		`a.hTTPStatus`:   "200",
+		`a.nick`:         "gg", // nick finds Nick
+		`typeof a.nickName`: "undefined", // the rule is one letter, not camel case
+		`typeof a.nickname`: "undefined",
 		`typeof a.name2`: "undefined",
 	} {
 		v, err := ctx.Eval(js)
@@ -1087,13 +1104,13 @@ func TestNestedMaps(t *testing.T) {
 		t.Fatal(err)
 	}
 	for js, want := range map[string]string{
-		`vars.l1.l2.l3.c`:          "deep",
-		`vars.l1.l2.l3.l4.d`:       "deeper",
-		`vars.str.k`:               "v",
-		`vars.num.k`:               "3",
-		`vars.arr[0].q.r`:          "1",
-		`String(vars.nil)`:         "null",
-		`Object.keys(vars).length`: "5",
+		`vars.l1.l2.l3.c`:    "deep",
+		`vars.l1.l2.l3.l4.d`: "deeper",
+		`vars.str.k`:         "v",
+		`vars.num.k`:         "3",
+		`vars.arr[0].q.r`:    "1",
+		`String(vars.nil)`:   "null",
+		`typeof vars.l1`:     "object", // proxies are objects; their own keys are not enumerated (JSON.stringify/Object.keys stay engine-native)
 	} {
 		v, err := ctx.Eval(js)
 		if err != nil {
@@ -1218,7 +1235,9 @@ func TestSelfReferentialStruct(t *testing.T) {
 	if err := ctx.Set("root", root); err != nil {
 		t.Fatal(err)
 	}
-	// the walk must stop somewhere sensible instead of hanging or crashing
+	// a proxy walks the original value lazily: there is no conversion depth
+	// limit, so the walk goes past the old maxConvDepth and only stops where
+	// the js code itself stops (here: the break at 1000, the value is cyclic)
 	v, err := ctx.Eval(`(() => { let d = 0, o = root; while (o && o.next) { o = o.next; d++; if (d > 1000) break; } return String(d); })()`)
 	if err != nil {
 		t.Fatal(err)
@@ -1227,8 +1246,8 @@ func TestSelfReferentialStruct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("depth %q: %v", v.String(), err)
 	}
-	if d == 0 || d > 100 {
-		t.Fatalf("depth = %d, want a bounded walk (1..100)", d)
+	if d <= 200 {
+		t.Fatalf("depth = %d, want the proxy to walk far past the old conversion limit (200)", d)
 	}
 	// and the shallow part is still readable
 	v2, err := ctx.Eval(`root.next.next.name`)

@@ -122,3 +122,43 @@ func TestConsoleLogRendersMethods(t *testing.T) {
 		t.Errorf("console.log shows undefined: %q", out)
 	}
 }
+
+// a proxy property write lands in the original golang value, and a GoObject
+// handed back to a golang function arrives as the original value itself
+// (zero copy, not a copy of it).
+func TestProxyWriteBackAndRoundTrip(t *testing.T) {
+	c, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	m := map[string]interface{}{"n": int64(1)}
+	item := &itItem{Name: "orig"}
+	c.Set("cfg", m)
+	c.Set("item", item)
+	var got *itItem
+	c.Set("take", func(p *itItem) { got = p })
+
+	if _, err := c.Eval(`cfg.n = 42`); err != nil {
+		t.Fatal(err)
+	}
+	if m["n"] != int64(42) {
+		t.Errorf("write-back lost: m[\"n\"] = %v, want 42", m["n"])
+	}
+
+	if _, err := c.Eval(`take(item)`); err != nil {
+		t.Fatal(err)
+	}
+	if got != item {
+		t.Errorf("round trip broke identity: got %p, want %p", got, item)
+	}
+
+	// a method call through the proxy mutates the original too
+	if _, err := c.Eval(`item.Rename("renamed")`); err != nil {
+		t.Fatal(err)
+	}
+	if item.Name != "renamed" {
+		t.Errorf("Rename through proxy did not reach the original: %q", item.Name)
+	}
+}

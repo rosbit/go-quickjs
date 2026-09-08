@@ -238,7 +238,7 @@ func (v *Value) Set(key string, val interface{}) error {
 	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
-	jv, err := toJsValue(v.ctx, val, true)
+	jv, err := toJsValue(v.ctx, val)
 	if err != nil {
 		return err
 	}
@@ -368,6 +368,11 @@ func fromJsValue(c *Context, v C.JSValue) (interface{}, error) {
 		// expected signature: hand back the value itself
 		return c.keep(C.qjs_dup_value(c.c, v)), nil
 	case C.qjs_is_object(v) != 0:
+		// a GoObject stands for the original golang value: hand that value
+		// over instead of walking the proxy
+		if rv, ok := goObjReflect(c, v); ok && rv.IsValid() {
+			return rv.Interface(), nil
+		}
 		return fromJsObject(c, v)
 	default:
 		return nil, nil

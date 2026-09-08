@@ -47,7 +47,7 @@ var (
 
 // toJsValue converts a golang value into a new JSValue. The caller owns the
 // result and must free it.
-func toJsValue(c *Context, v interface{}, withMethods bool) (C.JSValue, error) {
+func toJsValue(c *Context, v interface{}) (C.JSValue, error) {
 	if v == nil {
 		return C.qjs_null(), nil
 	}
@@ -103,28 +103,29 @@ func toJsValue(c *Context, v interface{}, withMethods bool) (C.JSValue, error) {
 	case time.Time:
 		return newJSString(c, x.Format(time.RFC3339Nano)), nil
 	}
-	return reflectToJs(c, reflect.ValueOf(v), withMethods)
+	return reflectToJs(c, reflect.ValueOf(v))
 }
 
-func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
+// reflectToJs hands a golang value over to javascript. Scalars travel as
+// plain js values; maps, slices, arrays and structs travel as GoObject
+// proxies standing for the original golang value, so js code walks them to
+// any depth with plain js syntax, calls their exported methods and writes
+// fields back -- without any depth limit and without copying.
+func reflectToJs(c *Context, rv reflect.Value) (C.JSValue, error) {
 	switch rv.Kind() {
 	case reflect.Interface, reflect.Ptr:
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
 		e := rv.Elem()
-		// A struct reached through an interface or a pointer is handed over
-		// as the pointer it is, not as rv.Elem(): that copy is not
-		// addressable, so pointer-receiver methods would be dropped and a
-		// proxy would stand for a copy instead of the original.
-		if isStructOrStructPtr(e) {
-			target := rv
-			if rv.Kind() == reflect.Interface {
-				target = e
-			}
-			return structToJs(c, target, withMethods)
+		switch e.Kind() {
+		case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+			// the proxy stands for the original value: the pointer itself
+			// for a pointer (writes reach the caller), the wrapped value
+			// for an interface
+			return makeProxy(c, rv), nil
 		}
-		return reflectToJs(c, e, withMethods)
+		return reflectToJs(c, e)
 	case reflect.Bool:
 		if rv.Bool() {
 			return C.qjs_true(), nil
@@ -148,23 +149,26 @@ func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, err
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
-		fallthrough
+		return makeProxy(c, rv), nil
 	case reflect.Array:
-		return sliceToJs(c, rv, withMethods)
+		return makeProxy(c, rv), nil
 	case reflect.Map:
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
-		return mapToJs(c, rv, withMethods)
+		return makeProxy(c, rv), nil
 	case reflect.Struct:
-		return structToJs(c, rv, withMethods)
+		if rv.Type() == timeType {
+			return newJSString(c, rv.Interface().(time.Time).Format(time.RFC3339Nano)), nil
+		}
+		return makeProxy(c, rv), nil
 	case reflect.Func:
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
 		f, err := registerGoFunc(c, rv)
 		if err != nil {
-			return f, err
+			return C.qjs_undefined(), err
 		}
 		nameGoFunc(c, f, goFuncName(rv))
 		return f, nil
@@ -173,9 +177,9 @@ func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, err
 	}
 }
 
-// maxConvDepth caps how deep a golang value is expanded into js objects. It
-// keeps a self-referencing value (a tree node pointing back at its parent)
-// from recursing forever; past the limit the value becomes null.
+// maxConvDepth caps how deep a javascript value is walked when it is turned
+// into a golang value. It keeps a self-referencing value (an object holding
+// itself) from recursing forever; past the limit the walk stops.
 const maxConvDepth = 64
 
 func (c *Context) enterConv() bool {
@@ -188,251 +192,15 @@ func (c *Context) enterConv() bool {
 
 func (c *Context) leaveConv() { c.convDepth-- }
 
-func sliceToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
-	if !c.enterConv() {
-		return C.qjs_null(), nil
-	}
-	defer c.leaveConv()
-	arr := C.qjs_new_array(c.c)
-	if C.JS_IsException(arr) != 0 {
-		return arr, errors.New("qjs: failed to create array")
-	}
-	for i := 0; i < rv.Len(); i++ {
-		// withMethods is passed on: a struct element must keep its methods
-		ev, err := reflectToJs(c, rv.Index(i), withMethods)
-		if err != nil {
-			ev = C.qjs_null()
-		}
-		if C.JS_SetPropertyUint32(c.c, arr, C.uint32_t(i), ev) < 0 { // consumes ev
-			C.JS_FreeValue(c.c, arr)
-			return C.qjs_undefined(), errSetProp
-		}
-	}
-	return arr, nil
-}
-
-func mapToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
-	if !c.enterConv() {
-		return C.qjs_null(), nil
-	}
-	defer c.leaveConv()
-	obj := C.qjs_new_object(c.c)
-	if C.JS_IsException(obj) != 0 {
-		return obj, errors.New("qjs: failed to create object")
-	}
-	iter := rv.MapRange()
-	for iter.Next() {
-		key := fmt.Sprintf("%v", iter.Key().Interface())
-		// withMethods is passed on: a struct value inside the map must keep
-		// its methods, and a nested map must pass it on in turn
-		ev, err := reflectToJs(c, iter.Value(), withMethods)
-		if err != nil {
-			ev = C.qjs_null()
-		}
-		ckey := C.CString(key)
-		ret := C.qjs_set_prop(c.c, obj, ckey, ev) // consumes ev
-		C.free(unsafe.Pointer(ckey))
-		if ret < 0 {
-			C.JS_FreeValue(c.c, obj)
-			return C.qjs_undefined(), errSetProp
-		}
-	}
-	return obj, nil
-}
-
-// structToJs turns a struct -- or a pointer to one -- into a js object.
-// Methods are bound from pv, which is always a pointer to the struct: pointer
-// receiver methods need the pointer, and a value that is not addressable (a
-// struct taken out of a map or an interface) is copied first.
-func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
-	if rv.Kind() == reflect.Ptr {
-		if rv.IsNil() {
-			return C.qjs_null(), nil
-		}
-		if rv.Elem().Kind() != reflect.Struct { // pointer to something else
-			return reflectToJs(c, rv.Elem(), withMethods)
-		}
-	}
-	// the value is handed over as it is, before any copy is made: a proxy
-	// must stand for the original, pointer and all
-	if !c.enterConv() {
-		return C.qjs_null(), nil
-	}
-	defer c.leaveConv()
-	pv := receiverOf(rv)
-	if pv.IsValid() && pv.Kind() == reflect.Ptr {
-		rv = pv.Elem()
-	}
-	if rv.Type() == timeType {
-		return newJSString(c, rv.Interface().(time.Time).Format(time.RFC3339Nano)), nil
-	}
-	obj := C.qjs_new_object(c.c)
-	if C.JS_IsException(obj) != 0 {
-		return obj, errors.New("qjs: failed to create object")
-	}
-	t := rv.Type()
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if f.PkgPath != "" { // unexported
-			continue
-		}
-		name, fromTag := fieldName(f)
-		if name == "" {
-			continue
-		}
-		fv := rv.Field(i)
-		// withMethods is passed on: a nested struct keeps its own methods
-		ev, err := reflectToJs(c, fv, withMethods)
-		if err != nil {
-			ev = C.qjs_null()
-		}
-		ckey := C.CString(name)
-		ret := C.qjs_set_prop(c.c, obj, ckey, ev) // consumes ev
-		C.free(unsafe.Pointer(ckey))
-		if ret < 0 {
-			C.JS_FreeValue(c.c, obj)
-			return C.qjs_undefined(), errSetProp
-		}
-		if !fromTag {
-			// also expose the field under the javascript convention, so that
-			// a.Name is reachable as a.name
-			setAlias(c, obj, name, ev)
-		}
-	}
-	if withMethods {
-		if err := bindMethods(c, obj, pv); err != nil {
-			C.JS_FreeValue(c.c, obj)
-			return C.qjs_undefined(), err
-		}
-	}
-	return obj, nil
-}
-
-// receiverOf returns the value methods should be bound from: always a pointer
-// to the struct, so that pointer receiver methods are part of the method set.
-// A struct that is not addressable (it came out of a map or an interface) is
-// copied; the copy is what the bound methods then see.
-func receiverOf(rv reflect.Value) reflect.Value {
-	if rv.Kind() == reflect.Ptr {
-		return rv
-	}
-	if rv.CanAddr() {
-		return rv.Addr()
-	}
-	cp := reflect.New(rv.Type())
-	cp.Elem().Set(rv)
-	return cp
-}
-
-// isStructOrStructPtr reports whether rv is a struct or a non-nil pointer to
-// one.
-func isStructOrStructPtr(rv reflect.Value) bool {
-	switch rv.Kind() {
-	case reflect.Struct:
-		return true
-	case reflect.Ptr:
-		return !rv.IsNil() && rv.Elem().Kind() == reflect.Struct
-	}
-	return false
-}
-
-func bindMethods(c *Context, obj C.JSValue, pv reflect.Value) error {
-	if !pv.IsValid() {
-		return nil
-	}
-	t := pv.Type()
-	for i := 0; i < t.NumMethod(); i++ {
-		m := t.Method(i)
-		if m.PkgPath != "" {
-			continue
-		}
-		mv := pv.Method(i)
-		if mv.Kind() != reflect.Func {
-			continue
-		}
-		fv, err := registerGoFunc(c, mv)
-		if err != nil {
-			continue
-		}
-		nameGoFunc(c, fv, m.Name)
-		ckey := C.CString(m.Name)
-		ret := C.qjs_set_prop(c.c, obj, ckey, fv) // consumes fv
-		C.free(unsafe.Pointer(ckey))
-		if ret < 0 {
-			return errSetProp
-		}
-		// a.Greet() is reachable as a.greet() too
-		setAlias(c, obj, m.Name, fv)
-	}
-	return nil
-}
-
-// setAlias exposes val a second time, under the lower-camel form of name. The
-// object already owns the reference handed to qjs_set_prop, so the value is
-// duplicated first; the duplicate is consumed by this second call.
-func setAlias(c *Context, obj C.JSValue, name string, val C.JSValue) {
-	alias := lowerCamel(name)
-	if alias == name {
-		return
-	}
-	C.JS_DupValue(c.c, val)
-	ckey := C.CString(alias)
-	C.qjs_set_prop(c.c, obj, ckey, val) // consumes the duplicate
-	C.free(unsafe.Pointer(ckey))
-}
-
-// fieldName returns the name a struct field is exposed under in javascript --
-// the json tag when there is one, the Go field name otherwise -- and whether
-// the name came from the tag. An explicit tag means the author chose the name,
-// so no lower-camel alias is derived from it.
-func fieldName(f reflect.StructField) (string, bool) {
-	tag, ok := f.Tag.Lookup("json")
-	if ok {
-		name := tag
-		if i := len(name); i > 0 {
-			for j := 0; j < i; j++ {
-				if name[j] == ',' {
-					name = name[:j]
-					break
-				}
-			}
-		}
-		if name == "-" {
-			return "", true
-		}
-		if name != "" {
-			return name, true
-		}
-	}
-	return f.Name, false
-}
-
-// lowerCamel turns an exported Go name into the javascript convention:
-// Name -> name, UserName -> userName, HTTPStatus -> httpStatus, ID -> id.
-// A name that does not start with an upper-case letter is returned untouched.
-func lowerCamel(s string) string {
+// lowerFirst turns an exported golang name into the javascript spelling a js
+// author most likely used: Name -> name. The lookup rule is symmetric: a key
+// is tried as it is first, then with its first letter toggled.
+func lowerFirst(s string) string {
 	if s == "" {
 		return s
 	}
 	rs := []rune(s)
-	k := 0
-	for k < len(rs) && unicode.IsUpper(rs[k]) {
-		k++
-	}
-	switch {
-	case k == 0:
-		return s
-	case k == len(rs): // ID -> id
-		for i := range rs {
-			rs[i] = unicode.ToLower(rs[i])
-		}
-	case k > 1: // HTTPStatus -> httpStatus
-		for i := 0; i < k-1; i++ {
-			rs[i] = unicode.ToLower(rs[i])
-		}
-	default: // Name -> name
-		rs[0] = unicode.ToLower(rs[0])
-	}
+	rs[0] = unicode.ToLower(rs[0])
 	return string(rs)
 }
 
@@ -490,6 +258,19 @@ func jsToGo(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, error) 
 			return reflect.Zero(t), nil
 		}
 		return reflect.ValueOf(gv), nil
+	}
+
+	// a GoObject handed back to golang stands for the original value: give
+	// that value itself when it fits the target type (zero copy, writes
+	// through it reach the original)
+	if rv, ok := goObjReflect(c, jsVal); ok && rv.IsValid() {
+		iv := rv.Interface()
+		if t.Kind() == reflect.Interface && t.NumMethod() == 0 {
+			return reflect.ValueOf(iv), nil
+		}
+		if reflect.TypeOf(iv).AssignableTo(t) {
+			return rv, nil
+		}
 	}
 
 	if C.qjs_is_undefined(jsVal) != 0 || C.qjs_is_null(jsVal) != 0 {
@@ -650,27 +431,22 @@ func jsToStruct(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, err
 		if f.PkgPath != "" {
 			continue
 		}
-		name, fromTag := fieldName(f)
-		if name == "" {
-			continue
-		}
-		cname := C.CString(name)
-		e := C.qjs_get_prop(c.c, jsVal, cname)
-		C.free(unsafe.Pointer(cname))
-		if C.JS_IsException(e) != 0 {
-			C.JS_FreeValue(c.c, e)
-			return reflect.Value{}, c.takeError()
-		}
-		if C.qjs_is_undefined(e) != 0 && !fromTag {
-			// javascript spelled the field in lower camel: a.name fills Name
-			C.JS_FreeValue(c.c, e)
-			calias := C.CString(lowerCamel(name))
-			e = C.qjs_get_prop(c.c, jsVal, calias)
-			C.free(unsafe.Pointer(calias))
+		// the lookup rule: the go field name as it is first, then with the
+		// first letter lower-cased (Name fills from name)
+		e := C.qjs_undefined()
+		for _, key := range []string{f.Name, lowerFirst(f.Name)} {
+			ckey := C.CString(key)
+			e = C.qjs_get_prop(c.c, jsVal, ckey)
+			C.free(unsafe.Pointer(ckey))
 			if C.JS_IsException(e) != 0 {
 				C.JS_FreeValue(c.c, e)
 				return reflect.Value{}, c.takeError()
 			}
+			if C.qjs_is_undefined(e) == 0 {
+				break
+			}
+			C.JS_FreeValue(c.c, e)
+			e = C.qjs_undefined()
 		}
 		if C.qjs_is_undefined(e) != 0 {
 			C.JS_FreeValue(c.c, e)

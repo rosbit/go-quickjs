@@ -233,7 +233,7 @@ func toJsResult(c *Context, v reflect.Value) C.JSValue {
 	if !v.IsValid() {
 		return C.qjs_undefined()
 	}
-	jv, err := toJsValue(c, v.Interface(), true)
+	jv, err := toJsValue(c, v.Interface())
 	if err != nil {
 		return C.qjs_undefined()
 	}
