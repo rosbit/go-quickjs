@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+type plainPoint struct {
+	X int
+	y string // unexported: excluded from json
+}
+
 // colors must appear only in terminal mode; captured writers (builders,
 // files, pipes) keep clean plain text.
 func TestConsoleColor(t *testing.T) {
@@ -32,14 +37,35 @@ func TestConsoleColor(t *testing.T) {
 	if got := formatArg(nil); !strings.Contains(got, cGray+"undefined"+cReset) {
 		t.Errorf("undefined not gray: %q", got)
 	}
-	if got := formatArg(map[string]interface{}{"k": "v"}); !strings.Contains(got, cRed+"v"+cReset) {
-		t.Errorf("object leaf not colored: %q", got)
+
+	// objects and arrays render as json in blue
+	if got := formatArg(map[string]interface{}{"Name": "pp"}); got != cBlue+`{"Name":"pp"}`+cReset {
+		t.Errorf("object not blue json: %q", got)
 	}
-	if got := formatArg([]interface{}{}); !strings.Contains(got, cCyan+"[]"+cReset) {
-		t.Errorf("empty array not cyan: %q", got)
+	if got := formatArg([]interface{}{"a", 1}); got != cBlue+`["a",1]`+cReset {
+		t.Errorf("array not blue json: %q", got)
 	}
+	if got := formatArg([]interface{}{}); got != cBlue+"[]"+cReset {
+		t.Errorf("empty array not blue: %q", got)
+	}
+	if got := formatArg(map[string]interface{}{}); got != cBlue+"{}"+cReset {
+		t.Errorf("empty object not blue: %q", got)
+	}
+
+	// methodless structs are json blue; unexported fields are dropped
+	if got := formatArg(plainPoint{X: 1, y: "hidden"}); got != cBlue+`{"X":1}`+cReset {
+		t.Errorf("plain struct not blue json: %q", got)
+	}
+	// structs with methods keep the js-style renderer
 	if got := formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {
 		t.Errorf("method not rendered: %q", got)
+	}
+
+	// cyclic maps cannot be json-encoded: js-style fallback, no hang
+	cyc := map[string]interface{}{}
+	cyc["self"] = cyc
+	if got := formatArg(cyc); !strings.Contains(got, "self:") {
+		t.Errorf("cyclic map fallback missing: %q", got)
 	}
 
 	// rendering must restore plain mode afterwards

@@ -7,6 +7,7 @@ package quickjs
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,8 +17,9 @@ import (
 	"unsafe"
 )
 
-// ANSI colors used by the console output (see also terminal conventions:
-// strings red, numbers yellow, objects cyan, functions blue).
+// ANSI colors used by the console output: strings and booleans red, numbers
+// yellow, objects/arrays (rendered as JSON) blue, functions blue,
+// undefined/null gray.
 const (
 	cReset  = "\033[0m"
 	cRed    = "\033[31m"
@@ -158,11 +160,15 @@ func formatValue(a interface{}, depth int) string {
 		return formatJsValue(v, depth)
 	case map[string]interface{}:
 		if len(v) == 0 {
-			return colorize(cCyan, "{}")
+			return colorize(cBlue, "{}")
 		}
 		if depth >= maxLogDepth {
 			return colorize(cGray, "{...}")
 		}
+		if b, err := json.Marshal(v); err == nil {
+			return colorize(cBlue, string(b))
+		}
+		// not json-encodable: fall back to the js-style renderer
 		keys := make([]string, 0, len(v))
 		for k := range v {
 			keys = append(keys, k)
@@ -175,11 +181,15 @@ func formatValue(a interface{}, depth int) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	case []interface{}:
 		if len(v) == 0 {
-			return colorize(cCyan, "[]")
+			return colorize(cBlue, "[]")
 		}
 		if depth >= maxLogDepth {
 			return colorize(cGray, "[...]")
 		}
+		if b, err := json.Marshal(v); err == nil {
+			return colorize(cBlue, string(b))
+		}
+		// not json-encodable: fall back to the js-style renderer
 		parts := make([]string, 0, len(v))
 		for _, e := range v {
 			parts = append(parts, formatValue(e, depth+1))
@@ -228,11 +238,15 @@ func formatGoReflect(rv reflect.Value, depth int) string {
 			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return colorize(cCyan, "{}")
+			return colorize(cBlue, "{}")
 		}
 		if depth >= maxLogDepth {
 			return colorize(cGray, "{...}")
 		}
+		if b, err := json.Marshal(rv.Interface()); err == nil {
+			return colorize(cBlue, string(b))
+		}
+		// not json-encodable (cyclic, non-string keys, funcs...): js-style
 		keys := make([]string, 0, rv.Len())
 		values := make(map[string]reflect.Value, rv.Len())
 		iter := rv.MapRange()
@@ -252,11 +266,15 @@ func formatGoReflect(rv reflect.Value, depth int) string {
 			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return colorize(cCyan, "[]")
+			return colorize(cBlue, "[]")
 		}
 		if depth >= maxLogDepth {
 			return colorize(cGray, "[...]")
 		}
+		if b, err := json.Marshal(rv.Interface()); err == nil {
+			return colorize(cBlue, string(b))
+		}
+		// not json-encodable: js-style
 		parts := make([]string, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			parts = append(parts, formatGoReflect(rv.Index(i), depth+1))
@@ -290,13 +308,19 @@ func goReflectFuncName(rv reflect.Value) string {
 	return "[Function]"
 }
 
-// formatGoStruct renders a struct -- or a pointer to one -- as {Field: v,
-// Method: [Function: M]}: the exported fields first, then the exported
-// methods. Rendering through a pointer keeps pointer-receiver methods in the
-// method set.
+// formatGoStruct renders a struct -- or a pointer to one. Without exported
+// methods it renders as json in blue; with methods the js-style renderer
+// keeps {Field: v, Method: [Function: M]} so the methods stay visible.
+// Rendering through a pointer keeps pointer-receiver methods in the method
+// set.
 func formatGoStruct(rv reflect.Value, depth int) string {
 	if depth >= maxLogDepth {
-		return "{...}"
+		return colorize(cGray, "{...}")
+	}
+	if rv.NumMethod() == 0 {
+		if b, err := json.Marshal(rv.Interface()); err == nil {
+			return colorize(cBlue, string(b))
+		}
 	}
 	fields := rv
 	if rv.Kind() == reflect.Ptr {
@@ -321,7 +345,7 @@ func formatGoStruct(rv reflect.Value, depth int) string {
 		parts = append(parts, m.Name+": [Function: "+m.Name+"]")
 	}
 	if len(parts) == 0 {
-		return colorize(cCyan, "{}")
+		return colorize(cBlue, "{}")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -350,7 +374,7 @@ func formatJsValue(v *Value, depth int) string {
 		}
 	}
 	if s, err := v.JSON(); err == nil && s != "" {
-		return colorize(cCyan, s)
+		return colorize(cBlue, s)
 	}
 	if v.IsString() {
 		return colorize(cRed, v.String())
