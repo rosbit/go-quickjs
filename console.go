@@ -19,6 +19,8 @@ import (
 // backed by golang, so that javascript code can log without pulling in the
 // whole quickjs-libc.
 func installBuiltins(c *Context) {
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	c.lock.lock()
 	defer c.lock.unlock()
 

@@ -33,18 +33,20 @@ func qjs_load_module(ctx *C.JSContext, name *C.char, outBuf **C.char, outLen *C.
 	}
 
 	n := len(data)
-	if n == 0 {
-		n = 1 // never return NULL: it would be read as a failure
-	}
-	p := C.malloc(C.size_t(n))
+	p := C.malloc(C.size_t(n + 1))
 	if p == nil {
 		return 0
 	}
-	if len(data) > 0 {
-		copy(unsafe.Slice((*byte)(p), len(data)), data)
-	}
+	// Null-terminate: QuickJS's parser respects the explicit len for tokens but
+	// peeks one byte past it to look for a statement terminator. Without a
+	// trailing \0 the peek reads malloc metadata, which on a freshly malloc'd
+	// block can be non-zero and trips spurious "expecting ';'" syntax errors
+	// when the module is compiled.
+	dst := unsafe.Slice((*byte)(p), n+1)
+	copy(dst, data)
+	dst[n] = 0
 	*outBuf = (*C.char)(p)
-	*outLen = C.size_t(len(data))
+	*outLen = C.size_t(n)
 	return 1
 }
 

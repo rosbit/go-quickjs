@@ -112,7 +112,19 @@ func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, err
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
-		return reflectToJs(c, rv.Elem(), withMethods)
+		e := rv.Elem()
+		// A struct reached through an interface or a pointer is handed over
+		// as the pointer it is, not as rv.Elem(): that copy is not
+		// addressable, so pointer-receiver methods would be dropped and a
+		// proxy would stand for a copy instead of the original.
+		if isStructOrStructPtr(e) {
+			target := rv
+			if rv.Kind() == reflect.Interface {
+				target = e
+			}
+			return structToJs(c, target, withMethods)
+		}
+		return reflectToJs(c, e, withMethods)
 	case reflect.Bool:
 		if rv.Bool() {
 			return C.qjs_true(), nil
@@ -156,13 +168,33 @@ func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, err
 	}
 }
 
+// maxConvDepth caps how deep a golang value is expanded into js objects. It
+// keeps a self-referencing value (a tree node pointing back at its parent)
+// from recursing forever; past the limit the value becomes null.
+const maxConvDepth = 64
+
+func (c *Context) enterConv() bool {
+	if c.convDepth >= maxConvDepth {
+		return false
+	}
+	c.convDepth++
+	return true
+}
+
+func (c *Context) leaveConv() { c.convDepth-- }
+
 func sliceToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
+	if !c.enterConv() {
+		return C.qjs_null(), nil
+	}
+	defer c.leaveConv()
 	arr := C.qjs_new_array(c.c)
 	if C.JS_IsException(arr) != 0 {
 		return arr, errors.New("qjs: failed to create array")
 	}
 	for i := 0; i < rv.Len(); i++ {
-		ev, err := reflectToJs(c, rv.Index(i), false)
+		// withMethods is passed on: a struct element must keep its methods
+		ev, err := reflectToJs(c, rv.Index(i), withMethods)
 		if err != nil {
 			ev = C.qjs_null()
 		}
@@ -175,6 +207,10 @@ func sliceToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error
 }
 
 func mapToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
+	if !c.enterConv() {
+		return C.qjs_null(), nil
+	}
+	defer c.leaveConv()
 	obj := C.qjs_new_object(c.c)
 	if C.JS_IsException(obj) != 0 {
 		return obj, errors.New("qjs: failed to create object")
@@ -182,7 +218,9 @@ func mapToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) 
 	iter := rv.MapRange()
 	for iter.Next() {
 		key := fmt.Sprintf("%v", iter.Key().Interface())
-		ev, err := reflectToJs(c, iter.Value(), false)
+		// withMethods is passed on: a struct value inside the map must keep
+		// its methods, and a nested map must pass it on in turn
+		ev, err := reflectToJs(c, iter.Value(), withMethods)
 		if err != nil {
 			ev = C.qjs_null()
 		}
@@ -197,7 +235,32 @@ func mapToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) 
 	return obj, nil
 }
 
+// structToJs turns a struct -- or a pointer to one -- into a js object.
+// Methods are bound from pv, which is always a pointer to the struct: pointer
+// receiver methods need the pointer, and a value that is not addressable (a
+// struct taken out of a map or an interface) is copied first.
 func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, error) {
+	if rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return C.qjs_null(), nil
+		}
+		if rv.Elem().Kind() != reflect.Struct { // pointer to something else
+			return reflectToJs(c, rv.Elem(), withMethods)
+		}
+	}
+	// the value is handed over as it is, before any copy is made: a proxy
+	// must stand for the original, pointer and all
+	if !c.enterConv() {
+		return C.qjs_null(), nil
+	}
+	defer c.leaveConv()
+	pv := receiverOf(rv)
+	if pv.IsValid() && pv.Kind() == reflect.Ptr {
+		rv = pv.Elem()
+	}
+	if rv.Type() == timeType {
+		return newJSString(c, rv.Interface().(time.Time).Format(time.RFC3339Nano)), nil
+	}
 	obj := C.qjs_new_object(c.c)
 	if C.JS_IsException(obj) != 0 {
 		return obj, errors.New("qjs: failed to create object")
@@ -213,7 +276,8 @@ func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, erro
 			continue
 		}
 		fv := rv.Field(i)
-		ev, err := reflectToJs(c, fv, false)
+		// withMethods is passed on: a nested struct keeps its own methods
+		ev, err := reflectToJs(c, fv, withMethods)
 		if err != nil {
 			ev = C.qjs_null()
 		}
@@ -231,18 +295,40 @@ func structToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, erro
 		}
 	}
 	if withMethods {
-		// methods of the value (pointer receiver methods only exist on the
-		// addressable/pointer value)
-		pv := rv
-		if rv.Kind() != reflect.Ptr && rv.CanAddr() {
-			pv = rv.Addr()
-		}
 		if err := bindMethods(c, obj, pv); err != nil {
 			C.JS_FreeValue(c.c, obj)
 			return C.qjs_undefined(), err
 		}
 	}
 	return obj, nil
+}
+
+// receiverOf returns the value methods should be bound from: always a pointer
+// to the struct, so that pointer receiver methods are part of the method set.
+// A struct that is not addressable (it came out of a map or an interface) is
+// copied; the copy is what the bound methods then see.
+func receiverOf(rv reflect.Value) reflect.Value {
+	if rv.Kind() == reflect.Ptr {
+		return rv
+	}
+	if rv.CanAddr() {
+		return rv.Addr()
+	}
+	cp := reflect.New(rv.Type())
+	cp.Elem().Set(rv)
+	return cp
+}
+
+// isStructOrStructPtr reports whether rv is a struct or a non-nil pointer to
+// one.
+func isStructOrStructPtr(rv reflect.Value) bool {
+	switch rv.Kind() {
+	case reflect.Struct:
+		return true
+	case reflect.Ptr:
+		return !rv.IsNil() && rv.Elem().Kind() == reflect.Struct
+	}
+	return false
 }
 
 func bindMethods(c *Context, obj C.JSValue, pv reflect.Value) error {

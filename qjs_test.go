@@ -392,6 +392,9 @@ func TestFinalizerReclaim(t *testing.T) {
 		}
 		_ = ctx
 	}
+	// force the finalizers to run; teardown() is fully serialized by
+	// runtimeLifeMu, so a freed runtime address can never be reused by the next
+	// test's JS_NewRuntime.
 	for i := 0; i < 5; i++ {
 		runtime.GC()
 	}
@@ -1058,5 +1061,217 @@ func TestLowerCamelArgs(t *testing.T) {
 		if got := v.String(); got != "bob:30" {
 			t.Fatalf("%s = %q", js, got)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// nested values: maps inside maps, structs inside maps/slices/structs
+
+func TestNestedMaps(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	inner := map[string]interface{}{"c": "deep", "l4": map[string]interface{}{"d": "deeper"}}
+	if err := ctx.SetAll(map[string]interface{}{
+		"vars": map[string]interface{}{
+			"l1":  map[string]interface{}{"l2": map[string]interface{}{"l3": inner}},
+			"str": map[string]string{"k": "v"},
+			"num": map[string]int{"k": 3},
+			"arr": []interface{}{map[string]interface{}{"q": map[string]interface{}{"r": 1}}},
+			"nil": nil,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for js, want := range map[string]string{
+		`vars.l1.l2.l3.c`:          "deep",
+		`vars.l1.l2.l3.l4.d`:       "deeper",
+		`vars.str.k`:               "v",
+		`vars.num.k`:               "3",
+		`vars.arr[0].q.r`:          "1",
+		`String(vars.nil)`:         "null",
+		`Object.keys(vars).length`: "5",
+	} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != want {
+			t.Fatalf("%s = %q, want %q", js, got, want)
+		}
+	}
+}
+
+type nestedMember struct {
+	Name string `json:"name"`
+}
+
+func (m *nestedMember) Greet(prefix string) string { return prefix + " " + m.Name }
+func (m *nestedMember) Age() int                   { return 30 }
+
+type nestedTeam struct {
+	Name    string                 `json:"name"`
+	Lead    *nestedMember          `json:"lead"`
+	Members []*nestedMember        `json:"members"`
+	Extra   map[string]interface{} `json:"extra"`
+}
+
+// methods survive one level down: a struct reached through a field, a slice
+// element or a map value must keep them
+func TestNestedStructMethods(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	team := &nestedTeam{
+		Name:    "core",
+		Lead:    &nestedMember{Name: "ana"},
+		Members: []*nestedMember{{Name: "bob"}},
+		Extra:   map[string]interface{}{"coach": &nestedMember{Name: "cyd"}},
+	}
+	if err := ctx.SetAll(map[string]interface{}{
+		"team":  team,
+		"wrap":  map[string]interface{}{"team": team},
+		"slist": []interface{}{team},
+		"get":   func() *nestedTeam { return team },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for js, want := range map[string]string{
+		`team.lead.Greet("hi")`:           "hi ana",
+		`team.lead.greet("hi")`:           "hi ana", // lower camel alias
+		`team.lead.age()`:                 "30",
+		`team.members[0].Greet("hi")`:     "hi bob",
+		`team.extra.coach.Greet("hi")`:    "hi cyd",
+		`wrap.team.lead.Greet("hi")`:      "hi ana",
+		`slist[0].members[0].Greet("hi")`: "hi bob",
+		`get().extra.coach.Greet("hi")`:   "hi cyd",
+		`typeof team.lead.Greet`:          "function",
+	} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != want {
+			t.Fatalf("%s = %q, want %q", js, got, want)
+		}
+	}
+}
+
+// a struct returned by value keeps its methods too: the value is copied, so
+// that pointer receiver methods have something to bind to
+func TestStructValueMethods(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	if err := ctx.SetAll(map[string]interface{}{
+		"byValue": func() nestedMember { return nestedMember{Name: "val"} },
+		"asAny":   func() interface{} { return &nestedMember{Name: "any"} },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for js, want := range map[string]string{
+		`byValue().name`:        "val",
+		`byValue().Greet("hi")`: "hi val",
+		`asAny().Greet("hi")`:   "hi any",
+		`typeof asAny().age`:    "function",
+	} {
+		v, err := ctx.Eval(js)
+		if err != nil {
+			t.Fatalf("%s: %v", js, err)
+		}
+		if got := v.String(); got != want {
+			t.Fatalf("%s = %q, want %q", js, got, want)
+		}
+	}
+}
+
+// a value that refers back to itself is cut off instead of recursing for
+// ever: the expansion is bounded, so the walk ends at a null
+func TestSelfReferentialStruct(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	type node struct {
+		Name string `json:"name"`
+		Next *node  `json:"next"`
+	}
+	root := &node{Name: "n0"}
+	cur := root
+	for i := 0; i < 200; i++ { // way deeper than maxConvDepth
+		cur.Next = &node{Name: "n"}
+		cur = cur.Next
+	}
+	cur.Next = root // and a cycle, for good measure
+
+	if err := ctx.Set("root", root); err != nil {
+		t.Fatal(err)
+	}
+	// the walk must stop somewhere sensible instead of hanging or crashing
+	v, err := ctx.Eval(`(() => { let d = 0, o = root; while (o && o.next) { o = o.next; d++; if (d > 1000) break; } return String(d); })()`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := strconv.Atoi(v.String())
+	if err != nil {
+		t.Fatalf("depth %q: %v", v.String(), err)
+	}
+	if d == 0 || d > 100 {
+		t.Fatalf("depth = %d, want a bounded walk (1..100)", d)
+	}
+	// and the shallow part is still readable
+	v2, err := ctx.Eval(`root.next.next.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v2.String(); got != "n" {
+		t.Fatalf("root.next.next.name = %q, want %q", got, "n")
+	}
+}
+
+// Setting the same value over and over must not wear the context out, and
+// must not grow either: no javascript object may be left behind by one round
+// of setting.
+func TestRepeatedSet(t *testing.T) {
+	ctx, err := qjs.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	type leaf struct {
+		Name string `json:"name"`
+	}
+	team := &leaf{Name: "ana"}
+	vars := func() map[string]interface{} {
+		return map[string]interface{}{
+			"cfg":   map[string]interface{}{"db": map[string]interface{}{"host": "h"}},
+			"team":  team,
+			"list":  []interface{}{map[string]interface{}{"a": 1}},
+			"other": &leaf{Name: "fresh"}, // a new value at a recycled address
+		}
+	}
+	for i := 0; i < 2000; i++ {
+		if err := ctx.SetAll(vars()); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+	v, err := ctx.Eval(`cfg.db.host + "/" + team.name + "/" + list[0].a`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.String(); got != "h/ana/1" {
+		t.Fatalf("got %q, want %q", got, "h/ana/1")
 	}
 }

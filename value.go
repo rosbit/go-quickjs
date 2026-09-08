@@ -26,6 +26,8 @@ func (v *Value) Free() {
 	if v == nil || v.freed || v.ctx == nil {
 		return
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	ctx := v.ctx
 	ctx.lock.lock()
 	defer ctx.lock.unlock()
@@ -54,6 +56,8 @@ func (v *Value) Freed() bool {
 	if v == nil {
 		return true
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	return v.freed || v.ctx.closed
@@ -111,6 +115,8 @@ func (v *Value) test(f func() bool) bool {
 	if v.check() != nil {
 		return false
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	if v.freed || v.ctx.closed {
@@ -124,6 +130,8 @@ func (v *Value) Bool() bool {
 	if v.check() != nil {
 		return false
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	return C.JS_ToBool(v.ctx.c, v.v) != 0
@@ -134,6 +142,8 @@ func (v *Value) Int64() int64 {
 	if v.check() != nil {
 		return 0
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	var i C.int64_t
@@ -146,6 +156,8 @@ func (v *Value) Float64() float64 {
 	if v.check() != nil {
 		return 0
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	var f C.double
@@ -159,6 +171,8 @@ func (v *Value) String() string {
 	if v.check() != nil {
 		return "<freed>"
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	if C.qjs_is_string(v.v) != 0 {
@@ -178,6 +192,8 @@ func (v *Value) Interface() (interface{}, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	if v.freed || v.ctx.closed {
@@ -191,6 +207,8 @@ func (v *Value) JSON() (string, error) {
 	if err := v.check(); err != nil {
 		return "", err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	return jsonStringify(v.ctx, v.v)
@@ -201,6 +219,8 @@ func (v *Value) Get(key string) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	ckey := C.CString(key)
@@ -214,6 +234,8 @@ func (v *Value) Set(key string, val interface{}) error {
 	if err := v.check(); err != nil {
 		return err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	jv, err := toJsValue(v.ctx, val, true)
@@ -234,6 +256,8 @@ func (v *Value) Call(args ...interface{}) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
@@ -247,6 +271,8 @@ func (v *Value) CallMethod(name string, args ...interface{}) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	cname := C.CString(name)
@@ -269,6 +295,8 @@ func (v *Value) Keys() ([]string, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	return propertyNames(v.ctx, v.v)
@@ -279,6 +307,8 @@ func (v *Value) Length() int {
 	if err := v.check(); err != nil {
 		return 0
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	if C.qjs_is_array(v.ctx.c, v.v) == 0 {
@@ -294,6 +324,8 @@ func (v *Value) Elem(i int) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
 	v.ctx.lock.lock()
 	defer v.ctx.lock.unlock()
 	e := C.qjs_get_prop_u32(v.ctx.c, v.v, C.uint32_t(i))
@@ -343,6 +375,10 @@ func fromJsValue(c *Context, v C.JSValue) (interface{}, error) {
 }
 
 func fromJsArray(c *Context, v C.JSValue) (interface{}, error) {
+	if !c.enterConv() { // a cycle in the javascript value: stop walking
+		return []interface{}{}, nil
+	}
+	defer c.leaveConv()
 	l := C.qjs_get_prop(c.c, v, C.qjs_length_str)
 	n := 0
 	if C.qjs_is_number(l) != 0 {
@@ -367,6 +403,10 @@ func fromJsArray(c *Context, v C.JSValue) (interface{}, error) {
 }
 
 func fromJsObject(c *Context, v C.JSValue) (interface{}, error) {
+	if !c.enterConv() { // a cycle in the javascript value: stop walking
+		return map[string]interface{}{}, nil
+	}
+	defer c.leaveConv()
 	names, err := propertyNames(c, v)
 	if err != nil {
 		return nil, err
