@@ -143,6 +143,19 @@ r = adder(1, 100)   // the function "adder" is implemented in Go
 console.log(r)
 ```
 
+### Inspecting Go values with console.log
+
+Go values passed to JS (maps, structs, pointers) are handed over with all
+fields at any nesting depth, and struct methods are callable as JS functions.
+`console.log` renders them so they can be inspected directly: fields are
+listed and methods show up as `[Function: Name]` instead of `undefined`.
+
+```javascript
+console.log(me)   // me is a *Person set from Go
+// {Greet: [Function: Greet], age: 18, greet: [Function: Greet], name: 绿兵, ...}
+me.greet("hi")    // methods are called on the original Go value
+```
+
 ### Status
 
 The package is not fully tested, so be careful.

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -84,6 +86,29 @@ func registerGoFunc(c *Context, fn reflect.Value) (C.JSValue, error) {
 		length = 0
 	}
 	return C.qjs_new_go_func(c.c, C.int(length), C.uint32_t(id)), nil
+}
+
+// nameGoFunc gives a registered go function a javascript `name` property, so
+// console.log can show it as [Function: name]. The value ns is consumed.
+func nameGoFunc(c *Context, f C.JSValue, name string) {
+	if name == "" {
+		return
+	}
+	C.JS_DefinePropertyValueStr(c.c, f, cName(), newJSString(c, name), C.JS_PROP_CONFIGURABLE)
+}
+
+// goFuncName returns a short name for a golang func value: the part after the
+// last slash of the runtime name ("pkg/pkg.File" -> "pkg.File"). Anonymous
+// funcs get "".
+func goFuncName(fn reflect.Value) string {
+	full := runtime.FuncForPC(fn.Pointer()).Name()
+	if full == "" {
+		return ""
+	}
+	if i := strings.LastIndex(full, "/"); i >= 0 {
+		full = full[i+1:]
+	}
+	return full
 }
 
 //export qjsGoFuncCallback

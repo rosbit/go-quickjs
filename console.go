@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"unsafe"
 )
@@ -73,6 +74,7 @@ func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {
 	if err != nil {
 		return
 	}
+	nameGoFunc(c, fv, name)
 	cname := C.CString(name)
 	ret := C.qjs_set_prop(c.c, obj, cname, fv) // consumes fv
 	C.free(unsafe.Pointer(cname))
@@ -91,21 +93,55 @@ func writeLine(w io.Writer, args ...interface{}) {
 		parts = append(parts, formatArg(a))
 	}
 	fmt.Fprintln(w, strings.Join(parts, " "))
+	releaseArgs(args)
 }
 
+// maxLogDepth keeps a self-referencing object from flooding the log.
+const maxLogDepth = 8
+
+// formatArg renders one console.log argument the way javascript developers
+// expect to read it: objects as {k: v}, arrays as [v, ...], functions as
+// [Function: name]. Go values handed over as objects show their fields and
+// methods, so console.log is enough to inspect them.
 func formatArg(a interface{}) string {
-	if v, ok := a.(*Value); ok {
-		if s, err := v.JSON(); err == nil && s != "" {
-			return s
-		}
-		return v.String()
-	}
-	if m, ok := a.(map[string]interface{}); ok {
-		return fmt.Sprintf("%v", m)
-	}
+	return formatValue(a, 0)
+}
+
+func formatValue(a interface{}, depth int) string {
 	switch v := a.(type) {
 	case nil:
 		return "undefined"
+	case *Value:
+		return formatJsValue(v, depth)
+	case map[string]interface{}:
+		if len(v) == 0 {
+			return "{}"
+		}
+		if depth >= maxLogDepth {
+			return "{...}"
+		}
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+": "+formatValue(v[k], depth+1))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	case []interface{}:
+		if len(v) == 0 {
+			return "[]"
+		}
+		if depth >= maxLogDepth {
+			return "[...]"
+		}
+		parts := make([]string, 0, len(v))
+		for _, e := range v {
+			parts = append(parts, formatValue(e, depth+1))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	case bool:
 		if v {
 			return "true"
@@ -122,5 +158,61 @@ func formatArg(a interface{}) string {
 		return v
 	default:
 		return fmt.Sprintf("%v", a)
+	}
+}
+
+// formatJsValue renders a raw js value: functions with their name, other
+// objects by walking their enumerable properties.
+func formatJsValue(v *Value, depth int) string {
+	if v == nil || v.Freed() {
+		return "undefined"
+	}
+	if v.IsFunction() {
+		name := ""
+		if nv, err := v.Get("name"); err == nil {
+			if s, e2 := nv.Interface(); e2 == nil {
+				if str, ok := s.(string); ok {
+					name = str
+				}
+			}
+			nv.Free()
+		}
+		if name != "" {
+			return "[Function: " + name + "]"
+		}
+		return "[Function]"
+	}
+	if v.IsObject() && depth < maxLogDepth {
+		if m, err := v.Interface(); err == nil {
+			return formatValue(m, depth+1)
+		}
+	}
+	if s, err := v.JSON(); err == nil && s != "" {
+		return s
+	}
+	return v.String()
+}
+
+// releaseArgs frees the temporary *Value instances created while converting
+// the js arguments of one log call; without this every logged object would
+// keep its function values alive until the context is closed.
+func releaseArgs(args []interface{}) {
+	for _, a := range args {
+		releaseValue(a)
+	}
+}
+
+func releaseValue(a interface{}) {
+	switch v := a.(type) {
+	case *Value:
+		v.Free()
+	case map[string]interface{}:
+		for _, e := range v {
+			releaseValue(e)
+		}
+	case []interface{}:
+		for _, e := range v {
+			releaseValue(e)
+		}
 	}
 }

@@ -39,6 +39,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -664,6 +665,10 @@ func (c *Context) Set(name string, v interface{}) error {
 	jsVal, err := toJsValue(c, v, true)
 	if err != nil {
 		return err
+	}
+	if reflect.ValueOf(v).Kind() == reflect.Func {
+		// the global name is the better function name for console.log
+		nameGoFunc(c, jsVal, name)
 	}
 	g := C.qjs_global(c.c)
 	cname := C.CString(name)

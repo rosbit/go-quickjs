@@ -162,7 +162,12 @@ func reflectToJs(c *Context, rv reflect.Value, withMethods bool) (C.JSValue, err
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
-		return registerGoFunc(c, rv)
+		f, err := registerGoFunc(c, rv)
+		if err != nil {
+			return f, err
+		}
+		nameGoFunc(c, f, goFuncName(rv))
+		return f, nil
 	default:
 		return C.qjs_undefined(), fmt.Errorf("qjs: unsupported type %s", rv.Type())
 	}
@@ -349,6 +354,7 @@ func bindMethods(c *Context, obj C.JSValue, pv reflect.Value) error {
 		if err != nil {
 			continue
 		}
+		nameGoFunc(c, fv, m.Name)
 		ckey := C.CString(m.Name)
 		ret := C.qjs_set_prop(c.c, obj, ckey, fv) // consumes fv
 		C.free(unsafe.Pointer(ckey))
