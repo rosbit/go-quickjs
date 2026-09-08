@@ -177,10 +177,25 @@ func mapKeyOf(rv reflect.Value, key string) (reflect.Value, bool) {
 	return v, true
 }
 
+// goObjToStringInner renders the proxied value the way fmt does. It backs
+// the toString/valueOf hooks, so javascript can convert a proxied value to
+// a primitive: String(v), "" + v, `${v}`, and calls that expect a string
+// (regex.test(v), ...) all work then.
+func goObjToStringInner(rv reflect.Value) string {
+	return fmt.Sprintf("%v", rv.Interface())
+}
+
 // goObjGetInner serves a property read on a proxied golang value.
 func goObjGetInner(c *Context, rv reflect.Value, key string) C.JSValue {
 	if key == "" {
 		return C.qjs_undefined()
+	}
+	if key == "toString" || key == "valueOf" {
+		fv := reflect.ValueOf(func() string { return goObjToStringInner(rv) })
+		if f, err := registerGoFunc(c, fv); err == nil {
+			nameGoFunc(c, f, key)
+			return f
+		}
 	}
 	switch rv.Kind() {
 	case reflect.Map:
@@ -230,6 +245,9 @@ func goObjGetInner(c *Context, rv reflect.Value, key string) C.JSValue {
 func goObjHasInner(rv reflect.Value, key string) bool {
 	if key == "" {
 		return false
+	}
+	if key == "toString" || key == "valueOf" {
+		return true
 	}
 	switch rv.Kind() {
 	case reflect.Map:

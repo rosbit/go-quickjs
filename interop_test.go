@@ -3,6 +3,7 @@ package quickjs
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 type itItem struct {
@@ -160,5 +161,59 @@ func TestProxyWriteBackAndRoundTrip(t *testing.T) {
 	}
 	if item.Name != "renamed" {
 		t.Errorf("Rename through proxy did not reach the original: %q", item.Name)
+	}
+}
+
+// a proxied value must convert to a primitive when javascript asks for it:
+// String(v), "" + v, template literals, and native calls that expect a
+// string (RegExp.prototype.test and friends) all go through ToPrimitive.
+// Without toString/valueOf on the proxy those threw TypeError: toPrimitive.
+func TestProxyToPrimitive(t *testing.T) {
+	c, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	type month struct{ S string }
+	c.SetAll(map[string]interface{}{
+		"data":  map[string]interface{}{"m": "2026-09"},
+		"m2":    month{S: "2026-09"},
+		"stamp": time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
+		"list":  []string{"a", "b"},
+	})
+
+	cases := map[string]string{
+		`String(m2)`:   "{2026-09}", // fmt %v of the struct
+		`'' + m2`:      "{2026-09}",
+		`String(stamp)`: "2026-09-08T10:00:00Z", // time.Time travels as an RFC3339 string, not a proxy
+		`String(list)`:  "[a b]",
+		`typeof data.m`: "string", // strings inside a proxy stay js strings
+	}
+	for code, want := range cases {
+		v, err := c.Eval(code)
+		if err != nil {
+			t.Errorf("%s: %v", code, err)
+			continue
+		}
+		got, _ := v.Interface()
+		v.Free()
+		if got != want {
+			t.Errorf("%s = %v, want %v", code, got, want)
+		}
+	}
+
+	// the motivating case: regex.test on a value that is a proxy
+	if _, err := c.Eval(`var regex = /^\d{4}-\d{2}$/`); err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.Eval(`regex.test("2026-09") && !regex.test(m2)`)
+	if err != nil {
+		t.Fatalf("regex.test on a proxy still throws: %v", err)
+	}
+	got, _ := v.Interface()
+	v.Free()
+	if got != true {
+		t.Errorf("regex.test sanity = %v, want true", got)
 	}
 }
