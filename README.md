@@ -34,15 +34,10 @@ func main() {
     return
   }
 
-  if err = ctx.SetAll(map[string]interface{}{
+  res, _ := ctx.Eval("a + b", map[string]interface{}{
      "a": 10,
      "b": 1,
-  }); err != nil {
-    fmt.Printf("%v\n", err)
-    return
-  }
-
-  res, _ := ctx.Eval("a + b")
+  })
   fmt.Println("result is:", res)
 }
 ```
@@ -76,7 +71,7 @@ func main() {
      return
   }
 
-  if _, err = ctx.EvalFile("a.js"); err != nil {
+  if _, err = ctx.EvalFile("a.js", nil); err != nil {
      fmt.Printf("%v\n", err)
      return
   }
@@ -124,13 +119,9 @@ func main() {
       return
   }
 
-  if err = ctx.SetAll(map[string]interface{}{
+  if _, err = ctx.EvalFile("b.js", map[string]interface{}{
       "adder": adder,  // b.js containing code calling "adder"
   }); err != nil {
-      fmt.Printf("%v\n", err)
-  }
-
-  if _, err = ctx.EvalFile("b.js"); err != nil {
       fmt.Printf("%v\n", err)
   }
 }
