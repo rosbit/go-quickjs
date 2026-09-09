@@ -434,8 +434,13 @@ func (c *Context) Global() *Value {
 	return c.keep(C.qjs_dup_value(c.c, g))
 }
 
-// Eval compiles and runs javascript source code.
-func (c *Context) Eval(code string) (*Value, error) {
+// Eval compiles and runs javascript source code. The optional vars are set as
+// globals before the code runs, so scripts can read them without a separate
+// SetAll call.
+func (c *Context) Eval(code string, vars map[string]interface{}) (*Value, error) {
+	if err := c.setAll(vars); err != nil {
+		return nil, err
+	}
 	b := []byte(code)
 	return c.evalBytes(b, "<eval>", EvalGlobal, false)
 }
@@ -448,12 +453,16 @@ func (c *Context) EvalModule(code, filename string) (*Value, error) {
 }
 
 // EvalFile loads a javascript file and runs it. ES modules (files containing
-// import/export) are detected automatically and evaluated as modules.
-func (c *Context) EvalFile(path string) (*Value, error) {
+// import/export) are detected automatically and evaluated as modules. The
+// optional vars are set as globals before the file runs.
+func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, error) {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
 	buf, err := os.ReadFile(path)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.setAll(vars); err != nil {
 		return nil, err
 	}
 	// imports of this file resolve relative to its own directory first
@@ -547,7 +556,7 @@ func (c *Context) Await(v *Value) (*Value, error) {
 // RunFile loads a javascript file and calls the named function with args,
 // returning its result. It is the "entry point of a js file" use case.
 func (c *Context) RunFile(path, entry string, args ...interface{}) (interface{}, error) {
-	if _, err := c.EvalFile(path); err != nil {
+	if _, err := c.EvalFile(path, nil); err != nil {
 		return nil, err
 	}
 	return c.Call(entry, args...)
@@ -683,8 +692,9 @@ func (c *Context) Set(name string, v interface{}) error {
 	return nil
 }
 
-// SetAll sets several globals at once.
-func (c *Context) SetAll(vars map[string]interface{}) error {
+// setAll sets several globals at once. It is a no-op for a nil/empty map and is
+// used by Eval/EvalFile so callers can pass script variables in one call.
+func (c *Context) setAll(vars map[string]interface{}) error {
 	for name, v := range vars {
 		if err := c.Set(name, v); err != nil {
 			return err

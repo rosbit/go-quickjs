@@ -26,7 +26,7 @@ func TestBindFuncVariadicSpread(t *testing.T) {
 		month = args[0];
 		if (!regex.test(month)) { throw new Error("Invalid month format: got " + typeof month + " " + String(month)); }
 		return args.join("|");
-	}`); err != nil {
+	}`, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -59,7 +59,7 @@ func TestBindFuncVariadicSliceElementStaysWhole(t *testing.T) {
 	if _, err := c.Eval(`function f(prefix) {
 		var args = Array.prototype.slice.call(arguments, 1);
 		return prefix + ":" + args.length + ":" + Array.isArray(args[0]);
-	}`); err != nil {
+	}`, nil); err != nil {
 		t.Fatal(err)
 	}
 

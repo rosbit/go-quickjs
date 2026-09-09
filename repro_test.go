@@ -22,7 +22,7 @@ func TestGoStringRegexTest(t *testing.T) {
 		var regex = /^\d{4}-\d{2}$/;
 		if (!regex.test(monthString)) { throw new Error("Invalid month format"); }
 		return true;
-	}`); err != nil {
+	}`, nil); err != nil {
 		t.Fatal(err)
 	}
 	fn, err := c.Get("validate")
@@ -40,7 +40,7 @@ func TestGoStringRegexTest(t *testing.T) {
 	if err := c.Set("monthString", "2026-09"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Eval(`validate(monthString)`); err != nil {
+	if _, err := c.Eval(`validate(monthString)`, nil); err != nil {
 		t.Fatalf("call with go string global: %v", err)
 	}
 

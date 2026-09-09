@@ -51,16 +51,13 @@ func newCtx(t *testing.T, code string) *qjs.Context {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	if err := ctx.SetAll(map[string]interface{}{
+	if _, err := ctx.Eval(code, map[string]interface{}{
 		"goAdd": goAdd,
 		"goErr": goErr,
 		"me":    &person{Name: "gopher", Age: 3},
 		"cfg":   map[string]interface{}{"debug": true},
 		"names": []string{"a", "b"},
 	}); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-	if _, err := ctx.Eval(code); err != nil {
 		t.Fatalf("eval: %v", err)
 	}
 	return ctx
@@ -75,7 +72,7 @@ func TestEval(t *testing.T) {
 	}
 	defer ctx.Close()
 
-	v, err := ctx.Eval("1 + 2 * 3")
+	v, err := ctx.Eval("1 + 2 * 3", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +88,7 @@ func TestEval(t *testing.T) {
 	if err := ctx.Set("m", map[string]interface{}{"a": 1}); err != nil {
 		t.Fatal(err)
 	}
-	vv, err := ctx.Eval("m.a")
+	vv, err := ctx.Eval("m.a", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +291,7 @@ func TestModuleImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(app); err != nil {
+	if _, err := ctx.EvalFile(app, nil); err != nil {
 		t.Fatal(err)
 	}
 	res, err := ctx.Call("run")
@@ -353,7 +350,7 @@ func TestSyntaxError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.Eval("function ( {"); err == nil {
+	if _, err := ctx.Eval("function ( {", nil); err == nil {
 		t.Fatal("expected syntax error")
 	}
 }
@@ -375,7 +372,7 @@ func TestCreateCloseStress(t *testing.T) {
 			if add(1, 2) != 3 {
 				t.Fatal("bad result")
 			}
-			v, err := ctx.Eval("({a: [1,2,3]})")
+			v, err := ctx.Eval("({a: [1,2,3]})", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -395,7 +392,7 @@ func TestFinalizerReclaim(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ctx.Eval("var x = []; for (var i=0;i<100;i++) x.push(i); x.length"); err != nil {
+		if _, err := ctx.Eval("var x = []; for (var i=0;i<100;i++) x.push(i); x.length", nil); err != nil {
 			t.Fatal(err)
 		}
 		_ = ctx
@@ -416,7 +413,7 @@ func TestUseAfterClose(t *testing.T) {
 	if err := ctx.BindFunc("add", &add); err != nil {
 		t.Fatal(err)
 	}
-	v, err := ctx.Eval("[1,2,3]")
+	v, err := ctx.Eval("[1,2,3]", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +452,7 @@ func TestConcurrentContexts(t *testing.T) {
 				return
 			}
 			for j := 0; j < 50; j++ {
-				res, err := ctx.Eval(`m.n`)
+				res, err := ctx.Eval(`m.n`, nil)
 				if err != nil {
 					t.Error(err)
 					return
@@ -482,7 +479,7 @@ func TestNestedCalls(t *testing.T) {
 
 	// jsDouble is a javascript function; the golang function below calls it
 	var jsDouble func(x int) int
-	if _, err := ctx.Eval("function jsDouble(x){return x*2}"); err != nil {
+	if _, err := ctx.Eval("function jsDouble(x){return x*2}", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := ctx.BindFunc("jsDouble", &jsDouble); err != nil {
@@ -500,7 +497,7 @@ func TestNestedCalls(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ctx.Eval("function goTwiceJs(x){return goTwice(x)}"); err != nil {
+	if _, err := ctx.Eval("function goTwiceJs(x){return goTwice(x)}", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -536,7 +533,7 @@ func TestGlobalGetSet(t *testing.T) {
 		t.Fatalf("got %#v", got)
 	}
 
-	obj, err := ctx.Eval("({list: [1,2], name: 'x'})")
+	obj, err := ctx.Eval("({list: [1,2], name: 'x'})", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +653,7 @@ func TestModuleSearchPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(filepath.Join(appDir, "main.js")); err != nil {
+	if _, err := ctx.EvalFile(filepath.Join(appDir, "main.js"), nil); err != nil {
 		t.Fatal(err)
 	}
 	res, err := ctx.Call("run", 3)
@@ -684,7 +681,7 @@ func TestModuleNextToEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(filepath.Join(dir, "main.js")); err != nil {
+	if _, err := ctx.EvalFile(filepath.Join(dir, "main.js"), nil); err != nil {
 		t.Fatal(err)
 	}
 	res, err := ctx.Call("run")
@@ -708,7 +705,7 @@ func TestModuleNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(app); err == nil {
+	if _, err := ctx.EvalFile(app, nil); err == nil {
 		t.Fatal("expected the missing import to fail")
 	} else if !strings.Contains(err.Error(), "nowhere") {
 		t.Fatalf("unexpected error: %v", err)
@@ -819,7 +816,7 @@ globalThis.counted = () => { const c = require('./counter'); return c.next(); };
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(main); err != nil {
+	if _, err := ctx.EvalFile(main, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -873,7 +870,7 @@ func TestRequireSearchPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(main); err != nil {
+	if _, err := ctx.EvalFile(main, nil); err != nil {
 		t.Fatal(err)
 	}
 	if v, err := ctx.Call("run"); err != nil || v != "shared" {
@@ -893,7 +890,7 @@ func TestRequireNotFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	if _, err := ctx.EvalFile(main); err == nil {
+	if _, err := ctx.EvalFile(main, nil); err == nil {
 		t.Fatal("expected the missing require to fail")
 	} else if !strings.Contains(err.Error(), "nope-not-here") {
 		t.Fatalf("unexpected error: %v", err)
@@ -907,7 +904,7 @@ func TestRequireDisabledByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ctx.Close()
-	v, err := ctx.Eval("typeof require")
+	v, err := ctx.Eval("typeof require", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -969,7 +966,7 @@ func TestFileCacheHasRequire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, err := ctx.Eval("typeof require"); err != nil || v.String() != "function" {
+	if v, err := ctx.Eval("typeof require", nil); err != nil || v.String() != "function" {
 		t.Fatalf("typeof require: %v, %v", v, err)
 	}
 	if v, err := ctx.Call("run"); err != nil || v != "lib" {
@@ -1026,7 +1023,7 @@ func TestLowerCamelNames(t *testing.T) {
 		`typeof a.nickname`: "undefined",
 		`typeof a.name2`: "undefined",
 	} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1040,7 +1037,7 @@ func TestLowerCamelNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, js := range []string{`b.Greet("hi")`, `b.greet("hi")`} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1071,7 +1068,7 @@ func TestLowerCamelArgs(t *testing.T) {
 		`describe({name: "bob", userAge: 30})`,
 		`describe({Name: "bob", UserAge: 30})`, // go spelling still works
 	} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1092,7 +1089,7 @@ func TestNestedMaps(t *testing.T) {
 	defer ctx.Close()
 
 	inner := map[string]interface{}{"c": "deep", "l4": map[string]interface{}{"d": "deeper"}}
-	if err := ctx.SetAll(map[string]interface{}{
+	vars := map[string]interface{}{
 		"vars": map[string]interface{}{
 			"l1":  map[string]interface{}{"l2": map[string]interface{}{"l3": inner}},
 			"str": map[string]string{"k": "v"},
@@ -1100,8 +1097,6 @@ func TestNestedMaps(t *testing.T) {
 			"arr": []interface{}{map[string]interface{}{"q": map[string]interface{}{"r": 1}}},
 			"nil": nil,
 		},
-	}); err != nil {
-		t.Fatal(err)
 	}
 	for js, want := range map[string]string{
 		`vars.l1.l2.l3.c`:    "deep",
@@ -1112,7 +1107,7 @@ func TestNestedMaps(t *testing.T) {
 		`String(vars.nil)`:   "null",
 		`typeof vars.l1`:     "object", // proxies are objects; their own keys are not enumerated (JSON.stringify/Object.keys stay engine-native)
 	} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, vars)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1151,13 +1146,11 @@ func TestNestedStructMethods(t *testing.T) {
 		Members: []*nestedMember{{Name: "bob"}},
 		Extra:   map[string]interface{}{"coach": &nestedMember{Name: "cyd"}},
 	}
-	if err := ctx.SetAll(map[string]interface{}{
+	vars := map[string]interface{}{
 		"team":  team,
 		"wrap":  map[string]interface{}{"team": team},
 		"slist": []interface{}{team},
 		"get":   func() *nestedTeam { return team },
-	}); err != nil {
-		t.Fatal(err)
 	}
 	for js, want := range map[string]string{
 		`team.lead.Greet("hi")`:           "hi ana",
@@ -1170,7 +1163,7 @@ func TestNestedStructMethods(t *testing.T) {
 		`get().extra.coach.Greet("hi")`:   "hi cyd",
 		`typeof team.lead.Greet`:          "function",
 	} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, vars)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1189,11 +1182,9 @@ func TestStructValueMethods(t *testing.T) {
 	}
 	defer ctx.Close()
 
-	if err := ctx.SetAll(map[string]interface{}{
+	vars := map[string]interface{}{
 		"byValue": func() nestedMember { return nestedMember{Name: "val"} },
 		"asAny":   func() interface{} { return &nestedMember{Name: "any"} },
-	}); err != nil {
-		t.Fatal(err)
 	}
 	for js, want := range map[string]string{
 		`byValue().name`:        "val",
@@ -1201,7 +1192,7 @@ func TestStructValueMethods(t *testing.T) {
 		`asAny().Greet("hi")`:   "hi any",
 		`typeof asAny().age`:    "function",
 	} {
-		v, err := ctx.Eval(js)
+		v, err := ctx.Eval(js, vars)
 		if err != nil {
 			t.Fatalf("%s: %v", js, err)
 		}
@@ -1238,7 +1229,7 @@ func TestSelfReferentialStruct(t *testing.T) {
 	// a proxy walks the original value lazily: there is no conversion depth
 	// limit, so the walk goes past the old maxConvDepth and only stops where
 	// the js code itself stops (here: the break at 1000, the value is cyclic)
-	v, err := ctx.Eval(`(() => { let d = 0, o = root; while (o && o.next) { o = o.next; d++; if (d > 1000) break; } return String(d); })()`)
+	v, err := ctx.Eval(`(() => { let d = 0, o = root; while (o && o.next) { o = o.next; d++; if (d > 1000) break; } return String(d); })()`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1250,7 +1241,7 @@ func TestSelfReferentialStruct(t *testing.T) {
 		t.Fatalf("depth = %d, want the proxy to walk far past the old conversion limit (200)", d)
 	}
 	// and the shallow part is still readable
-	v2, err := ctx.Eval(`root.next.next.name`)
+	v2, err := ctx.Eval(`root.next.next.name`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1282,11 +1273,13 @@ func TestRepeatedSet(t *testing.T) {
 		}
 	}
 	for i := 0; i < 2000; i++ {
-		if err := ctx.SetAll(vars()); err != nil {
-			t.Fatalf("iteration %d: %v", i, err)
+		for k, v := range vars() {
+			if err := ctx.Set(k, v); err != nil {
+				t.Fatalf("iteration %d: %v", i, err)
+			}
 		}
 	}
-	v, err := ctx.Eval(`cfg.db.host + "/" + team.name + "/" + list[0].a`)
+	v, err := ctx.Eval(`cfg.db.host + "/" + team.name + "/" + list[0].a`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

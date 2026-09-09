@@ -64,7 +64,7 @@ func main() {
 	// ------------------------------------------------------------------
 	// 3. extend javascript with golang functions and values
 	// ------------------------------------------------------------------
-	if err := ctx.SetAll(map[string]interface{}{
+	if _, err := ctx.EvalFile(script, map[string]interface{}{
 		"adder":   adder,
 		"sumAll":  sumAll,
 		"withErr": withErr,
@@ -72,11 +72,6 @@ func main() {
 		"cfg":     map[string]interface{}{"debug": true, "retry": 3},
 		"names":   []string{"go", "quickjs", "cgo"},
 	}); err != nil {
-		fmt.Printf("set: %v\n", err)
-		return
-	}
-
-	if _, err := ctx.EvalFile(script); err != nil {
 		fmt.Printf("eval: %v\n", err)
 		return
 	}
@@ -142,7 +137,7 @@ func main() {
 	}
 
 	// module import
-	if _, err := ctx.EvalFile(filepath.Join("example", "scripts", "app.js")); err != nil {
+	if _, err := ctx.EvalFile(filepath.Join("example", "scripts", "app.js"), nil); err != nil {
 		fmt.Printf("module eval: %v\n", err)
 	} else {
 		m, err := ctx.Call("runModule")

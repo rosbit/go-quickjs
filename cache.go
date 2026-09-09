@@ -145,13 +145,7 @@ func newContextFromFile(path string, vars map[string]interface{}, opts []Option,
 	if err != nil {
 		return nil, err
 	}
-	if len(vars) > 0 {
-		if err := ctx.SetAll(vars); err != nil {
-			ctx.Close()
-			return nil, err
-		}
-	}
-	if _, err := ctx.EvalFile(path); err != nil {
+	if _, err := ctx.EvalFile(path, vars); err != nil {
 		ctx.Close()
 		return nil, err
 	}

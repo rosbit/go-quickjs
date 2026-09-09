@@ -21,7 +21,7 @@ func TestCountStaffInMonthArgs(t *testing.T) {
 		month = args[0];
 		if (!regex.test(month)) { throw new Error("Invalid month format: got " + typeof month + " " + String(month)); }
 		return "ok:" + month;
-	}`); err != nil {
+	}`, nil); err != nil {
 		t.Fatal(err)
 	}
 	fn, err := c.Get("countStaffInMonth")

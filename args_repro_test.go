@@ -18,7 +18,7 @@ func TestOsArgsSliceAsMonthString(t *testing.T) {
 		var regex = /^\d{4}-\d{2}$/;
 		if (!regex.test(monthString)) { throw new Error("Invalid month format: " + String(monthString)); }
 		return true;
-	}`); err != nil {
+	}`, nil); err != nil {
 		t.Fatal(err)
 	}
 	fn, err := c.Get("validate")
@@ -45,7 +45,7 @@ func TestOsArgsSliceAsMonthString(t *testing.T) {
 
 	// inside JS: args proxy index access also yields a plain string
 	c.Set("args", args)
-	if _, err := c.Eval(`validate(args[0])`); err != nil {
+	if _, err := c.Eval(`validate(args[0])`, nil); err != nil {
 		t.Fatalf("args[0] from proxy: %v", err)
 	}
 }
@@ -57,7 +57,7 @@ func TestSliceToStringRendering(t *testing.T) {
 	}
 	defer c.Close()
 	c.Set("args", []string{"2026-09"})
-	v, err := c.Eval(`String(args)`)
+	v, err := c.Eval(`String(args)`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

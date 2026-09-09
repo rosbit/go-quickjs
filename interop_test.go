@@ -29,7 +29,7 @@ func TestSetAllNestedMaps(t *testing.T) {
 	}
 	defer c.Close()
 
-	err = c.SetAll(map[string]interface{}{
+	err = c.setAll(map[string]interface{}{
 		"vars": map[string]interface{}{
 			"a":   1,
 			"sub": map[string]interface{}{"b": "bee", "c": 3.5},
@@ -47,7 +47,7 @@ func TestSetAllNestedMaps(t *testing.T) {
 		"typeof vars.sub": "object",
 	}
 	for code, want := range cases {
-		v, err := c.Eval(code)
+		v, err := c.Eval(code, nil)
 		if err != nil {
 			t.Errorf("eval %q: %v", code, err)
 			continue
@@ -85,7 +85,7 @@ func TestStructMethodsFromGoFunc(t *testing.T) {
 		`typeof getHolder().Item.Upper`: "function",
 	}
 	for code, want := range cases {
-		v, err := c.Eval(code)
+		v, err := c.Eval(code, nil)
 		if err != nil {
 			t.Errorf("eval %q: %v", code, err)
 			continue
@@ -109,7 +109,7 @@ func TestConsoleLogRendersMethods(t *testing.T) {
 	defer c.Close()
 
 	c.Set("p", &itItem{Name: "pp"})
-	if _, err := c.Eval(`console.log("p:", p)`); err != nil {
+	if _, err := c.Eval(`console.log("p:", p)`, nil); err != nil {
 		t.Fatal(err)
 	}
 	out := sb.String()
@@ -141,14 +141,14 @@ func TestProxyWriteBackAndRoundTrip(t *testing.T) {
 	var got *itItem
 	c.Set("take", func(p *itItem) { got = p })
 
-	if _, err := c.Eval(`cfg.n = 42`); err != nil {
+	if _, err := c.Eval(`cfg.n = 42`, nil); err != nil {
 		t.Fatal(err)
 	}
 	if m["n"] != int64(42) {
 		t.Errorf("write-back lost: m[\"n\"] = %v, want 42", m["n"])
 	}
 
-	if _, err := c.Eval(`take(item)`); err != nil {
+	if _, err := c.Eval(`take(item)`, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got != item {
@@ -156,7 +156,7 @@ func TestProxyWriteBackAndRoundTrip(t *testing.T) {
 	}
 
 	// a method call through the proxy mutates the original too
-	if _, err := c.Eval(`item.Rename("renamed")`); err != nil {
+	if _, err := c.Eval(`item.Rename("renamed")`, nil); err != nil {
 		t.Fatal(err)
 	}
 	if item.Name != "renamed" {
@@ -176,7 +176,7 @@ func TestProxyToPrimitive(t *testing.T) {
 	defer c.Close()
 
 	type month struct{ S string }
-	c.SetAll(map[string]interface{}{
+	c.setAll(map[string]interface{}{
 		"data":  map[string]interface{}{"m": "2026-09"},
 		"m2":    month{S: "2026-09"},
 		"stamp": time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
@@ -191,7 +191,7 @@ func TestProxyToPrimitive(t *testing.T) {
 		`typeof data.m`: "string", // strings inside a proxy stay js strings
 	}
 	for code, want := range cases {
-		v, err := c.Eval(code)
+		v, err := c.Eval(code, nil)
 		if err != nil {
 			t.Errorf("%s: %v", code, err)
 			continue
@@ -204,10 +204,10 @@ func TestProxyToPrimitive(t *testing.T) {
 	}
 
 	// the motivating case: regex.test on a value that is a proxy
-	if _, err := c.Eval(`var regex = /^\d{4}-\d{2}$/`); err != nil {
+	if _, err := c.Eval(`var regex = /^\d{4}-\d{2}$/`, nil); err != nil {
 		t.Fatal(err)
 	}
-	v, err := c.Eval(`regex.test("2026-09") && !regex.test(m2)`)
+	v, err := c.Eval(`regex.test("2026-09") && !regex.test(m2)`, nil)
 	if err != nil {
 		t.Fatalf("regex.test on a proxy still throws: %v", err)
 	}
