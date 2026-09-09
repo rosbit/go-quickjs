@@ -35,13 +35,18 @@
 #define LRE_FLAG_STICKY     (1 << 5)
 #define LRE_FLAG_INDICES    (1 << 6) /* Unused by libregexp, just recorded. */
 #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
+#define LRE_FLAG_UNICODE_SETS (1 << 8)
 
 #define LRE_RET_MEMORY_ERROR (-1)
 #define LRE_RET_TIMEOUT      (-2)
 
+/* trailer length after the group name including the trailing '\0' */
+#define LRE_GROUP_NAME_TRAILER_LEN 2 
+
 uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
                      void *opaque);
+int lre_get_alloc_count(const uint8_t *bc_buf);
 int lre_get_capture_count(const uint8_t *bc_buf);
 int lre_get_flags(const uint8_t *bc_buf);
 const char *lre_get_groupnames(const uint8_t *bc_buf);

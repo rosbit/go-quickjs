@@ -121,21 +121,16 @@ DEF(     apply_eval, 3, 2, 1, u16) /* func array -> ret_eval */
 DEF(         regexp, 1, 2, 1, none) /* create a RegExp object from the pattern and a
                                        bytecode string */
 DEF(      get_super, 1, 1, 1, none)
-DEF(         import, 1, 1, 1, none) /* dynamic module import */
+DEF(         import, 1, 2, 1, none) /* dynamic module import */
 
-DEF(      check_var, 5, 0, 1, atom) /* check if a variable exists */
-DEF(  get_var_undef, 5, 0, 1, atom) /* push undefined if the variable does not exist */
-DEF(        get_var, 5, 0, 1, atom) /* throw an exception if the variable does not exist */
-DEF(        put_var, 5, 1, 0, atom) /* must come after get_var */
-DEF(   put_var_init, 5, 1, 0, atom) /* must come after put_var. Used to initialize a global lexical variable */
-DEF( put_var_strict, 5, 2, 0, atom) /* for strict mode variable write */
+DEF(  get_var_undef, 3, 0, 1, var_ref) /* push undefined if the variable does not exist */
+DEF(        get_var, 3, 0, 1, var_ref) /* throw an exception if the variable does not exist */
+DEF(        put_var, 3, 1, 0, var_ref) /* must come after get_var */
+DEF(   put_var_init, 3, 1, 0, var_ref) /* must come after put_var. Used to initialize a global lexical variable */
 
 DEF(  get_ref_value, 1, 2, 3, none)
 DEF(  put_ref_value, 1, 3, 0, none)
 
-DEF(     define_var, 6, 0, 0, atom_u8)
-DEF(check_define_var, 6, 0, 0, atom_u8)
-DEF(    define_func, 6, 1, 0, atom_u8)
 DEF(      get_field, 5, 1, 1, atom)
 DEF(     get_field2, 5, 1, 2, atom)
 DEF(      put_field, 5, 2, 0, atom)
@@ -144,6 +139,7 @@ DEF( put_private_field, 1, 3, 0, none) /* obj value prop -> */
 DEF(define_private_field, 1, 3, 1, none) /* obj prop value -> obj */
 DEF(   get_array_el, 1, 2, 1, none)
 DEF(  get_array_el2, 1, 2, 2, none) /* obj prop -> obj value */
+DEF(  get_array_el3, 1, 2, 3, none) /* obj prop -> obj prop1 value */
 DEF(   put_array_el, 1, 3, 0, none)
 DEF(get_super_value, 1, 3, 1, none) /* this obj prop -> value */
 DEF(put_super_value, 1, 4, 0, none) /* this obj prop value -> */
@@ -172,6 +168,7 @@ DEF(    set_var_ref, 3, 1, 1, var_ref) /* must come after put_var_ref */
 DEF(set_loc_uninitialized, 3, 0, 0, loc)
 DEF(  get_loc_check, 3, 0, 1, loc)
 DEF(  put_loc_check, 3, 1, 0, loc) /* must come after get_loc_check */
+DEF(  set_loc_check, 3, 1, 1, loc) /* must come after put_loc_check */
 DEF(  put_loc_check_init, 3, 1, 0, loc)
 DEF(get_loc_checkthis, 3, 0, 1, loc)
 DEF(get_var_ref_check, 3, 0, 1, var_ref)
@@ -189,7 +186,6 @@ DEF(      nip_catch, 1, 2, 1, none) /* catch ... a -> a */
 DEF(      to_object, 1, 1, 1, none)
 //DEF(      to_string, 1, 1, 1, none)
 DEF(     to_propkey, 1, 1, 1, none)
-DEF(    to_propkey2, 1, 2, 2, none)
 
 DEF(   with_get_var, 10, 1, 0, atom_label_u8)     /* must be in the same order as scope_xxx */
 DEF(   with_put_var, 10, 2, 1, atom_label_u8)     /* must be in the same order as scope_xxx */

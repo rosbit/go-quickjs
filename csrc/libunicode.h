@@ -26,6 +26,11 @@
 
 #include <stdint.h>
 
+/* unicode standard version */
+#define LIBUNICODE_UNICODE_VERSION_MAJOR 17
+#define LIBUNICODE_UNICODE_VERSION_MINOR 0
+#define LIBUNICODE_UNICODE_VERSION_PATCH 0
+
 /* define it to include all the unicode tables (40KB larger) */
 #define CONFIG_ALL_UNICODE
 
@@ -45,6 +50,7 @@ typedef enum {
     CR_OP_UNION,
     CR_OP_INTER,
     CR_OP_XOR,
+    CR_OP_SUB,
 } CharRangeOpEnum;
 
 void cr_init(CharRange *cr, void *mem_opaque, void *(*realloc_func)(void *opaque, void *ptr, size_t size));
@@ -73,18 +79,17 @@ static inline int cr_add_interval(CharRange *cr, uint32_t c1, uint32_t c2)
     return 0;
 }
 
-int cr_union1(CharRange *cr, const uint32_t *b_pt, int b_len);
+int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
+          const uint32_t *b_pt, int b_len, int op);
+int cr_op1(CharRange *cr, const uint32_t *b_pt, int b_len, int op);
 
 static inline int cr_union_interval(CharRange *cr, uint32_t c1, uint32_t c2)
 {
     uint32_t b_pt[2];
     b_pt[0] = c1;
     b_pt[1] = c2 + 1;
-    return cr_union1(cr, b_pt, 2);
+    return cr_op1(cr, b_pt, 2, CR_OP_UNION);
 }
-
-int cr_op(CharRange *cr, const uint32_t *a_pt, int a_len,
-          const uint32_t *b_pt, int b_len, int op);
 
 int cr_invert(CharRange *cr);
 
@@ -106,6 +111,10 @@ int unicode_normalize(uint32_t **pdst, const uint32_t *src, int src_len,
 int unicode_script(CharRange *cr, const char *script_name, int is_ext);
 int unicode_general_category(CharRange *cr, const char *gc_name);
 int unicode_prop(CharRange *cr, const char *prop_name);
+
+typedef void UnicodeSequencePropCB(void *opaque, const uint32_t *buf, int len);
+int unicode_sequence_prop(const char *prop_name, UnicodeSequencePropCB *cb, void *opaque,
+                          CharRange *cr);
 
 int lre_case_conv(uint32_t *res, uint32_t c, int conv_type);
 int lre_canonicalize(uint32_t c, int is_unicode);
@@ -141,6 +150,11 @@ static inline int lre_is_id_continue_byte(uint8_t c) {
     return lre_ctype_bits[c] & (UNICODE_C_UPPER | UNICODE_C_LOWER |
                                 UNICODE_C_UNDER | UNICODE_C_DOLLAR |
                                 UNICODE_C_DIGIT);
+}
+
+static inline int lre_is_word_byte(uint8_t c) {
+    return lre_ctype_bits[c] & (UNICODE_C_UPPER | UNICODE_C_LOWER |
+                                UNICODE_C_UNDER | UNICODE_C_DIGIT);
 }
 
 int lre_is_space_non_ascii(uint32_t c);
