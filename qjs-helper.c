@@ -151,3 +151,52 @@ JSValue qjs_eval_module(JSContext *ctx, const char *buf, size_t len,
     qjs_set_import_meta(ctx, JS_VALUE_GET_PTR(val), 1, filename);
     return JS_EvalFunction(ctx, val);
 }
+
+/*
+ * Render val with QuickJS' built-in pretty-printer (JS_PrintValue) -- the same
+ * formatter the qjs REPL uses for console.log/print. The output is written
+ * into a malloc'd buffer returned through out/out_len; the caller frees it
+ * with qjs_print_value_free. We implement the write callback in C because cgo
+ * cannot hand a Go closure to a C function pointer directly.
+ */
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+} qjs_print_buf;
+
+static void qjs_print_write(void *opaque, const char *buf, size_t len)
+{
+    qjs_print_buf *p = (qjs_print_buf *)opaque;
+    if (p->len + len > p->cap) {
+        size_t newcap = p->cap ? p->cap * 2 : 64;
+        while (newcap < p->len + len)
+            newcap *= 2;
+        char *nb = realloc(p->buf, newcap);
+        if (!nb)
+            return;
+        p->buf = nb;
+        p->cap = newcap;
+    }
+    memcpy(p->buf + p->len, buf, len);
+    p->len += len;
+}
+
+int qjs_print_value(JSContext *ctx, JSValueConst val, char **out, size_t *out_len)
+{
+    qjs_print_buf p = {0};
+    JSPrintValueOptions opts;
+    JS_PrintValueSetDefaultOptions(&opts);
+    opts.max_depth = 8;          /* match console.go maxLogDepth */
+    opts.max_string_length = 0;  /* no truncation */
+    opts.max_item_count = 0;     /* no truncation */
+    JS_PrintValue(ctx, qjs_print_write, &p, val, &opts);
+    *out = p.buf;
+    *out_len = p.len;
+    return 0;
+}
+
+void qjs_print_value_free(char *buf)
+{
+    free(buf);
+}

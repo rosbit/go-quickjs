@@ -93,6 +93,10 @@ static inline JSValue qjs_json_stringify(JSContext *ctx, JSValueConst v) {
 	return JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
 }
 
+/* ---- value pretty-print (wraps the upstream JS_PrintValue) ---- */
+int  qjs_print_value(JSContext *ctx, JSValueConst val, char **out, size_t *out_len);
+void qjs_print_value_free(char *buf);
+
 /* ---- promises ---- */
 static inline int qjs_is_promise(JSContext *ctx, JSValueConst v) {
 	JSValue then;

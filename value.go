@@ -214,6 +214,69 @@ func (v *Value) JSON() (string, error) {
 	return jsonStringify(v.ctx, v.v)
 }
 
+// Pretty renders the value with QuickJS' built-in pretty-printer
+// (JS_PrintValue) -- the same formatter the qjs REPL uses for
+// console.log/print. It correctly shows the types JSON.stringify cannot
+// represent: Date, RegExp, Map, Set, Error stacks, typed arrays, getters,
+// circular references and BigInt. The output is plain text (no ANSI color);
+// the console wraps it in the structural color.
+func (v *Value) Pretty() string {
+	if v.check() != nil {
+		return "undefined"
+	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
+	v.ctx.lock.lock()
+	defer v.ctx.lock.unlock()
+	var cstr *C.char
+	var clen C.size_t
+	C.qjs_print_value(v.ctx.c, v.v, &cstr, &clen)
+	if cstr == nil {
+		return "undefined"
+	}
+	defer C.qjs_print_value_free(cstr)
+	return C.GoStringN(cstr, C.int(clen))
+}
+
+// isGoObject reports whether the value is a GoObject proxy standing for an
+// underlying golang value. The console uses this to choose between the Go
+// reflection renderer (fields + [Function: M]) and the upstream JS
+// pretty-printer.
+func (v *Value) isGoObject() bool {
+	if v.check() != nil {
+		return false
+	}
+	if _, ok := goObjReflect(v.ctx, v.v); ok {
+		return true
+	}
+	return false
+}
+
+// isPlainJs reports whether the value is a plain JS object (JS_CLASS_OBJECT)
+// or an array (JS_CLASS_ARRAY) -- types JSON.stringify renders faithfully.
+// Exotic objects (Date, RegExp, Map, Set, Error, typed arrays, ...) return
+// false so the console can route them to the upstream pretty-printer instead.
+// JS_CLASS_OBJECT == 1 and JS_CLASS_ARRAY == 2 are stable internal QuickJS
+// class IDs ("JS_CLASS_OBJECT = 1 /* must be first */" in quickjs.c); Go
+// proxies carry their own registered class id and are excluded here too.
+func (v *Value) isPlainJs() bool {
+	if v.check() != nil {
+		return false
+	}
+	jsGlobalLock.lock()
+	defer jsGlobalLock.unlock()
+	v.ctx.lock.lock()
+	defer v.ctx.lock.unlock()
+	if v.freed || v.ctx.closed {
+		return false
+	}
+	if C.qjs_is_object(v.v) == 0 {
+		return false
+	}
+	id := int(C.JS_GetClassID(v.v))
+	return id == 1 || id == 2
+}
+
 // Get reads a property of the value.
 func (v *Value) Get(key string) (*Value, error) {
 	if err := v.check(); err != nil {

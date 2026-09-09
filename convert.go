@@ -239,7 +239,7 @@ func jsToGo(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, error) 
 	// *Value and Value are handed over as-is
 	if t == typeValue {
 		v := c.keep(C.qjs_dup_value(c.c, jsVal))
-		return reflect.ValueOf(v).Elem(), nil
+		return reflect.ValueOf(v), nil
 	}
 	if t == typeContext {
 		return reflect.ValueOf(c), nil

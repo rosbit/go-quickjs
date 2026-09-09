@@ -80,11 +80,11 @@ func installBuiltins(c *Context) {
 	if C.JS_IsException(console) != 0 {
 		return
 	}
-	defineGoFunc(c, console, "log", func(args ...interface{}) { writeLine(stdout, args...) })
-	defineGoFunc(c, console, "info", func(args ...interface{}) { writeLine(stdout, args...) })
-	defineGoFunc(c, console, "debug", func(args ...interface{}) { writeLine(stdout, args...) })
-	defineGoFunc(c, console, "warn", func(args ...interface{}) { writeLine(stderr, args...) })
-	defineGoFunc(c, console, "error", func(args ...interface{}) { writeLine(stderr, args...) })
+	defineGoFunc(c, console, "log", logWriter(stdout))
+	defineGoFunc(c, console, "info", logWriter(stdout))
+	defineGoFunc(c, console, "debug", logWriter(stdout))
+	defineGoFunc(c, console, "warn", logWriter(stderr))
+	defineGoFunc(c, console, "error", logWriter(stderr))
 
 	global := C.qjs_global(c.c)
 	if C.JS_IsException(global) != 0 {
@@ -95,9 +95,7 @@ func installBuiltins(c *Context) {
 	C.qjs_define_prop(c.c, global, cname, console) // consumes console
 	C.free(unsafe.Pointer(cname))
 
-	printFn, err := registerGoFunc(c, reflect.ValueOf(func(args ...interface{}) {
-		writeLine(stdout, args...)
-	}))
+	printFn, err := registerGoFunc(c, reflect.ValueOf(logWriter(stdout)))
 	if err == nil {
 		pname := C.CString("print")
 		C.qjs_define_prop(c.c, global, pname, printFn) // consumes printFn
@@ -112,8 +110,19 @@ func installBuiltins(c *Context) {
 	}
 }
 
-func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {
-	fv, err := registerGoFunc(c, reflect.ValueOf(fn))
+// logWriter builds a console function that forwards its raw JS arguments
+// (kept as *Value so genuine JS objects reach the pretty-printer) to writeLine.
+func logWriter(w io.Writer) func(args ...*Value) {
+	return func(args ...*Value) {
+		ia := make([]interface{}, len(args))
+		for i, a := range args {
+			ia[i] = a
+		}
+		writeLine(w, ia...)
+	}
+}
+
+func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {	fv, err := registerGoFunc(c, reflect.ValueOf(fn))
 	if err != nil {
 		return
 	}
@@ -350,13 +359,23 @@ func formatGoStruct(rv reflect.Value, depth int) string {
 	return "{" + strings.Join(parts, ", ") + "}"
 }
 
-// formatJsValue renders a raw js value: functions with their name, other
-// objects by walking their enumerable properties.
+// formatJsValue renders a raw js value. Go proxies (GoObject) keep the Go
+// reflection renderer (fields + [Function: M]); plain JS objects and arrays are
+// rendered as JSON (e.g. {"Name":"pp"}) -- the faithful, pre-upgrade output the
+// user expects; only the exotic types JSON cannot represent (Date, RegExp,
+// Map, Set, Error, typed arrays, circular refs, BigInt) fall through to
+// QuickJS' upstream pretty-printer (JS_PrintValue), the same one the qjs REPL
+// uses for console.log.
 func formatJsValue(v *Value, depth int) string {
 	if v == nil || v.Freed() {
 		return colorize(cGray, "undefined")
 	}
-	if v.IsFunction() {
+	switch {
+	case v.IsUndefined():
+		return colorize(cGray, "undefined")
+	case v.IsNull():
+		return colorize(cGray, "null")
+	case v.IsFunction():
 		name := ""
 		if nv, err := v.Get("name"); err == nil {
 			if s, e2 := nv.Interface(); e2 == nil {
@@ -367,19 +386,38 @@ func formatJsValue(v *Value, depth int) string {
 			nv.Free()
 		}
 		return colorize(cBlue, goJsFuncName(name))
+	case v.IsString():
+		return colorize(cRed, v.String())
+	case v.IsBool():
+		return colorize(cRed, fmt.Sprintf("%v", v.Bool()))
+	case v.IsNumber():
+		f := v.Float64()
+		if f == float64(int64(f)) {
+			return colorize(cYellow, fmt.Sprintf("%d", int64(f)))
+		}
+		return colorize(cYellow, fmt.Sprintf("%v", f))
 	}
-	if v.IsObject() && depth < maxLogDepth {
+	// Go proxies: keep the Go reflection renderer (fields + [Function: M]).
+	if v.isGoObject() {
 		if m, err := v.Interface(); err == nil {
 			return formatValue(m, depth+1)
 		}
 	}
-	if s, err := v.JSON(); err == nil && s != "" {
-		return colorize(cBlue, s)
+	// Plain JS objects and arrays: faithful JSON, e.g. {"Name":"pp"}. This keeps
+	// the output the user expects, matching the pre-upgrade console.
+	if v.isPlainJs() {
+		if s, err := v.JSON(); err == nil && s != "" {
+			return colorize(cBlue, s)
+		}
 	}
-	if v.IsString() {
-		return colorize(cRed, v.String())
+	// Exotic JS values (Date, RegExp, Map, Set, Error, typed arrays, circular):
+	// use QuickJS' built-in pretty-printer (JS_PrintValue), the same one the qjs
+	// REPL uses for console.log.
+	s := v.Pretty()
+	if s == "" {
+		return colorize(cGray, "undefined")
 	}
-	return v.String()
+	return colorize(cBlue, s)
 }
 
 func goJsFuncName(name string) string {
