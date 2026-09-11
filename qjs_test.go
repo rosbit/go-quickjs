@@ -385,8 +385,11 @@ func TestCreateCloseStress(t *testing.T) {
 	runtime.GC()
 }
 
-// contexts that are never closed must be reclaimed by the finalizer
-func TestFinalizerReclaim(t *testing.T) {
+// The real "contexts that are never closed must be reclaimed by the finalizer"
+// assertion lives in finalizer_internal_test.go (package quickjs), because it
+// needs to inspect the unexported liveRuntimes map. This file is package
+// quickjs_test and cannot. Kept here only as a no-crash smoke test.
+func TestFinalizerReclaimSmoke(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		ctx, err := qjs.New()
 		if err != nil {

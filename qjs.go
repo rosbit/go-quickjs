@@ -13,8 +13,10 @@
 // during init/gc because of those points, so they are worth stating):
 //
 //   - a quickjs runtime owns its contexts: JS_FreeContext must be called before
-//     JS_FreeRuntime. Here a single golang object (*Runtime) owns everything and
-//     is the only one carrying a finalizer, so the order is always correct.
+//     JS_FreeRuntime. teardown enforces that order (context first, then runtime)
+//     in one place, so it is correct no matter which golang object carries the
+//     finalizer. The *Context is the only exported handle and the only object
+//     carrying a finalizer; jsRuntime is an unexported 1:1 implementation detail.
 //   - no golang pointer is ever stored in C memory. Go callbacks are reached
 //     through a plain uint32 id which is looked up in a golang side registry
 //     owned by the runtime; once the runtime is closed the registry is dropped,
@@ -46,6 +48,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+	"weak"
 )
 
 // ErrClosed is returned when a Context or Runtime is used after being closed.
@@ -65,14 +68,14 @@ const (
 // ModuleLoader loads the source of a module imported by javascript code.
 type ModuleLoader func(name string) ([]byte, error)
 
-// Runtime wraps a quickjs JSRuntime. A Runtime hosts exactly one Context: the
-// two are 1:1 and fully independent, so every Context owns its own runtime and
-// freeing one never touches another. This independence is what lets us avoid
-// the random free-time crashes of earlier versions.
-type Runtime struct {
+// jsRuntime wraps a quickjs JSRuntime. A jsRuntime hosts exactly one Context:
+// the two are 1:1 and fully independent, so every Context owns its own runtime
+// and freeing one never touches another. This independence is what lets us avoid
+// the random free-time crashes of earlier versions. jsRuntime is unexported:
+// from the caller's point of view a Context is the whole engine.
+type jsRuntime struct {
 	rt     *C.JSRuntime
 	mu     sync.Mutex
-	ctx    *Context // the single context this runtime hosts (1:1)
 	funcs  *funcStore
 	loader ModuleLoader
 	modulePaths []string
@@ -81,15 +84,21 @@ type Runtime struct {
 	stderr      io.Writer
 	closed      bool
 	lastFunc    uint32
+	id          uint64 // stable identity for the liveRuntimes address-reuse guard
 }
 
-// Context wraps a quickjs JSContext.
+// Context wraps a quickjs JSContext and is the only handle callers see. It owns
+// its underlying jsRuntime (1:1). Because forgetting Close must not leak, a
+// finalizer on the *Context reclaims the engine when it becomes unreachable;
+// Close cancels that finalizer so explicit release is immediate and the
+// finalizer only ever fires as a safety net.
 type Context struct {
-	rt     *Runtime
+	rt     *jsRuntime
 	c      *C.JSContext
 	lock   reentrant
-	values map[*Value]struct{}
+	values map[weak.Pointer[Value]]struct{} // weak refs so the context never pins its *Value objects, which would deadlock the finalizers of the c<->v cycle
 	closed bool
+	id     uint64 // stable identity for the liveContexts address-reuse guard
 
 	// module resolution state, only touched while an Eval/Call holds the lock
 	mainDir string // directory of the file given to EvalFile/RunFile
@@ -109,7 +118,7 @@ type options struct {
 	stderr       io.Writer
 }
 
-// Option customizes a Runtime.
+// Option customizes a Context (and its underlying runtime).
 type Option func(*options)
 
 // WithMemoryLimit sets the quickjs memory limit, in bytes. 0 means unlimited.
@@ -161,24 +170,21 @@ func WithConsoleWriter(stdout, stderr io.Writer) Option {
 	return func(o *options) { o.stdout, o.stderr = stdout, stderr }
 }
 
-// New creates a Runtime together with its single Context and returns the
-// Context. It is the same object Runtime.ctx points at.
+// New creates a jsRuntime together with its single Context and returns the
+// Context. It is the same object the underlying jsRuntime hosts (1:1).
 func New(opts ...Option) (*Context, error) {
-	r, err := NewRuntime(opts...)
-	if err != nil {
-		return nil, err
-	}
-	return r.ctx, nil
+	return newRuntime(opts...)
 }
 
-// NewRuntime creates a quickjs runtime together with its single context. The
-// context is reachable through Runtime.ctx and through New / NewContext.
+// newRuntime creates a quickjs runtime together with its single context and
+// returns the Context. The jsRuntime itself is unexported because it is a 1:1
+// implementation detail of the Context that callers never need to name.
 //
 // Allocation and registration happen under runtimeLifeMu, so that a runtime
 // address is always claimed in the liveRuntimes table before any finalizer can
 // inspect it. installBuiltins runs after the lock is released because it
 // executes javascript and must not block other create/free operations.
-func NewRuntime(opts ...Option) (*Runtime, error) {
+func newRuntime(opts ...Option) (*Context, error) {
 	o := &options{
 		stdout: os.Stdout,
 		stderr: os.Stderr,
@@ -214,7 +220,7 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 		C.JS_SetMaxStackSize(rt, C.size_t(o.maxStackSize))
 	}
 
-	r := &Runtime{
+	r := &jsRuntime{
 		rt:          rt,
 		funcs:       newFuncStore(),
 		loader:      o.loader,
@@ -222,6 +228,7 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 		require:     o.require,
 		stdout:      o.stdout,
 		stderr:      o.stderr,
+		id:          atomic.AddUint64(&runtimeIDSeq, 1),
 	}
 
 	c := C.JS_NewContext(rt)
@@ -232,24 +239,29 @@ func NewRuntime(opts ...Option) (*Runtime, error) {
 	ctx := &Context{
 		rt:     r,
 		c:      c,
-		values: make(map[*Value]struct{}),
+		values: make(map[weak.Pointer[Value]]struct{}),
+		id:     atomic.AddUint64(&runtimeIDSeq, 1),
 	}
-	r.ctx = ctx
 	registerContext(ctx)
-	liveContexts[uintptr(unsafe.Pointer(c))] = ctx
+	liveContexts[uintptr(unsafe.Pointer(c))] = ctx.id
 
 	// claim the address: the finalizer re-checks this before freeing, so a late
-	// finaliser can never release a live, address-reused runtime.
-	liveRuntimes[uintptr(unsafe.Pointer(rt))] = r
+	// finaliser can never release a live, address-reused runtime. We store only
+	// the stable id, never the Go pointer, so the registry does not keep the
+	// runtime alive and the *Context finalizer can actually fire.
+	liveRuntimes[uintptr(unsafe.Pointer(rt))] = r.id
 
 	// installBuiltins executes javascript; it re-acquires jsGlobalLock and
 	// c.lock reentrantly and does not touch the liveRuntimes/liveContexts maps.
 	installBuiltins(ctx)
 
-	// the only finalizer of the whole design: it closes the context and frees
-	// the runtime, but only if this *Runtime still owns the address.
-	runtime.SetFinalizer(r, finalizeRuntime)
-	return r, nil
+	// The *Context carries the only finalizer of the whole design: it reclaims
+	// the engine (context then runtime, in that order) when the caller forgot to
+	// Close. Storing ids -- not pointers -- in the live tables above means the
+	// context is truly unreachable once the caller drops it, so this safety net
+	// really runs instead of leaking forever.
+	runtime.SetFinalizer(ctx, finalizeContext)
+	return ctx, nil
 }
 
 // ReadFile is the default ModuleLoader.
@@ -257,24 +269,24 @@ func ReadFile(name string) ([]byte, error) {
 	return os.ReadFile(name)
 }
 
-// finalizeRuntime is the finalizer installed on the *Runtime. It runs only when
-// the runtime (and therefore its context) is no longer reachable, i.e. when the
+// finalizeContext is the finalizer installed on the *Context. It runs only when
+// the context (and therefore its runtime) is no longer reachable, i.e. when the
 // user forgot to Close. It is fully serialized by runtimeLifeMu against every
 // other allocation and deallocation, so a freed runtime address can never be
 // reused by a live one.
-func finalizeRuntime(r *Runtime) {
+func finalizeContext(c *Context) {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
 	runtimeLifeMu.Lock()
 	defer runtimeLifeMu.Unlock()
-	teardown(r)
+	teardown(c.rt, c)
 }
 
 // teardown frees the single context and then the runtime. The caller must hold
 // both jsGlobalLock and runtimeLifeMu (in that order), so the liveRuntimes
 // table and every quickjs C call are serialised against all other operations.
 // It is safe to call more than once.
-func teardown(r *Runtime) {
+func teardown(r *jsRuntime, c *Context) {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -282,8 +294,13 @@ func teardown(r *Runtime) {
 	}
 	r.mu.Unlock()
 
-	if r.ctx != nil {
-		r.ctx.closeLocked()
+	// c is handed in explicitly rather than stored on the jsRuntime: storing a
+	// pointer (even a weak one) that points back at the finalizing *Context would
+	// either create a reference cycle (strong) or, with a weak.Pointer, be nil'd
+	// out by the time the context's own finalizer runs. finalizeContext already
+	// has c, so it passes it straight through.
+	if c != nil {
+		c.closeLocked()
 	}
 
 	r.mu.Lock()
@@ -301,7 +318,7 @@ func teardown(r *Runtime) {
 		// that case freeing here would corrupt that live runtime. The check is
 		// safe because liveRuntimes is guarded by runtimeLifeMu, which this
 		// function's caller holds.
-		if liveRuntimes[addr] == r {
+		if liveRuntimes[addr] == r.id {
 			delete(liveRuntimes, addr)
 			C.JS_FreeRuntime(r.rt)
 		}
@@ -310,58 +327,24 @@ func teardown(r *Runtime) {
 	}
 }
 
-// NewContext returns the single Context hosted by this Runtime. A Runtime hosts
-// exactly one Context (created together with the Runtime by New/NewRuntime), so
-// this is the same object New returns. It exists for API compatibility; the 1:1
-// relationship means there is no second context to create.
-func (r *Runtime) NewContext() (*Context, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, ErrClosed
-	}
-	if r.ctx == nil {
-		return nil, errors.New("qjs: runtime has no context")
-	}
-	return r.ctx, nil
-}
-
-// Close frees the runtime and its context. It is safe to call Close more than
-// once and from several goroutines.
-func (r *Runtime) Close() {
+// GC forces a quickjs garbage collection on this context's runtime. It is safe to
+// call at any time; a closed context is a no-op.
+func (c *Context) GC() {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	runtimeLifeMu.Lock()
-	defer runtimeLifeMu.Unlock()
-	teardown(r)
-	runtime.SetFinalizer(r, nil)
-}
-
-// GC forces a quickjs garbage collection.
-func (r *Runtime) GC() {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
+	c.rt.mu.Lock()
+	defer c.rt.mu.Unlock()
+	if c.closed || c.rt.closed {
 		return
 	}
-	C.JS_RunGC(r.rt)
+	C.JS_RunGC(c.rt.rt)
 }
-
-// Closed reports whether the runtime has been closed.
-func (r *Runtime) Closed() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.closed
-}
-
-// Runtime returns the runtime owning the context.
-func (c *Context) Runtime() *Runtime { return c.rt }
 
 // Close frees the context and the runtime it belongs to. Because a Context and
-// its Runtime are 1:1, closing the context frees the whole engine. Close is
-// idempotent and safe to call from several goroutines.
+// its jsRuntime are 1:1, closing the context frees the whole engine. Close is
+// idempotent and safe to call from several goroutines. It also cancels the
+// safety-net finalizer so the engine is released immediately, not whenever the
+// next GC happens to run.
 func (c *Context) Close() error {
 	if c == nil {
 		return nil
@@ -370,8 +353,8 @@ func (c *Context) Close() error {
 	defer jsGlobalLock.unlock()
 	runtimeLifeMu.Lock()
 	defer runtimeLifeMu.Unlock()
-	teardown(c.rt)
-	runtime.SetFinalizer(c.rt, nil)
+	teardown(c.rt, c)
+	runtime.SetFinalizer(c, nil)
 	return nil
 }
 
@@ -385,20 +368,27 @@ func (c *Context) closeLocked() {
 	if c.closed {
 		return
 	}
-	// free the values first: they must not outlive their context
-	for v := range c.values {
+	// free the values first: they must not outlive their context. The map holds
+	// weak references to the *Value objects, so a value may already have been
+	// reclaimed by the GC (its own finalizer freed the JSValue); we simply skip
+	// such nil entries.
+	for wp := range c.values {
+		v := wp.Value()
+		if v == nil {
+			continue
+		}
 		C.JS_FreeValue(c.c, v.v)
 		v.freed = true
 		v.ctx = nil
 		runtime.SetFinalizer(v, nil)
 	}
-	c.values = make(map[*Value]struct{})
+	c.values = make(map[weak.Pointer[Value]]struct{})
 
 	caddr := uintptr(unsafe.Pointer(c.c))
 	// Only free if we still own this address. A JS_NewContext may have reused it
 	// for a different, live context after this finaliser was scheduled; the check
 	// is safe under runtimeLifeMu, which the caller holds.
-	if liveContexts[caddr] == c {
+	if liveContexts[caddr] == c.id {
 		delete(liveContexts, caddr)
 		C.JS_FreeContext(c.c)
 	}
@@ -791,7 +781,7 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 // keep registers a JSValue and returns the golang wrapper.
 func (c *Context) keep(v C.JSValue) *Value {
 	nv := &Value{ctx: c, v: v}
-	c.values[nv] = struct{}{}
+	c.values[weak.Make(nv)] = struct{}{}
 	runtime.SetFinalizer(nv, finalizeValue)
 	return nv
 }
@@ -832,7 +822,7 @@ func finalizeValue(v *Value) {
 		return
 	}
 	rt := v.ctx.rt
-	if rt == nil || rt.rt == nil || liveRuntimes[uintptr(unsafe.Pointer(rt.rt))] != rt {
+	if rt == nil || rt.rt == nil || liveRuntimes[uintptr(unsafe.Pointer(rt.rt))] != rt.id {
 		// Address reused by a different live runtime, or already gone: drop.
 		v.freed = true
 		v.ctx = nil
@@ -850,7 +840,7 @@ func finalizeValue(v *Value) {
 	C.JS_FreeValue(c.c, v.v)
 	v.freed = true
 	v.ctx = nil
-	delete(c.values, v)
+	delete(c.values, weak.Make(v))
 	c.lock.unlock()
 	runtimeLifeMu.Unlock()
 }
@@ -860,8 +850,13 @@ func finalizeValue(v *Value) {
 // ---------------------------------------------------------------------------
 
 var (
+	// runtimeIDSeq mints a stable identity for every jsRuntime/Context. The id is
+	// what the live tables store (never the Go pointer), so those tables no longer
+	// keep the engine alive and the *Context finalizer can actually run.
+	runtimeIDSeq uint64
+
 	registryMu  sync.RWMutex
-	ctxRegistry = map[uintptr]*Context{}
+	ctxRegistry = map[uintptr]weak.Pointer[Context]{}
 
 	// runtimeLifeMu serialises access to the liveRuntimes/liveContexts tables
 	// and the closed flags against every allocation and deallocation. It is
@@ -870,17 +865,18 @@ var (
 	// runtime can never deadlock against a concurrent allocation or eval.
 	runtimeLifeMu sync.Mutex
 
-	// liveRuntimes maps a JSRuntime* (as uintptr) to the *Runtime that currently
-	// owns it. A runtime finalizer holds a raw C pointer that can be reused by a
-	// later JS_NewRuntime, so before freeing it re-checks it still owns the
-	// address. A late finaliser therefore never releases a live, address-reused
-	// runtime -- it becomes a no-op instead of a use-after-free.
-	liveRuntimes = map[uintptr]*Runtime{}
+	// liveRuntimes maps a JSRuntime* (as uintptr) to the id of the jsRuntime that
+	// currently owns it. A runtime finalizer holds a raw C pointer that can be
+	// reused by a later JS_NewRuntime, so before freeing it re-checks it still
+	// owns the address. A late finaliser therefore never releases a live,
+	// address-reused runtime -- it becomes a no-op instead of a use-after-free.
+	// We store the id, not the *jsRuntime, so this table does not pin the engine.
+	liveRuntimes = map[uintptr]uint64{}
 
-	// liveContexts maps a JSContext* (as uintptr) to the *Context that currently
-	// owns it, mirroring liveRuntimes for the context level. Used to assert that
-	// a JS_FreeContext only ever frees memory this context actually owns.
-	liveContexts = map[uintptr]*Context{}
+	// liveContexts maps a JSContext* (as uintptr) to the id of the *Context that
+	// currently owns it, mirroring liveRuntimes for the context level. Used to
+	// assert that a JS_FreeContext only ever frees memory this context owns.
+	liveContexts = map[uintptr]uint64{}
 
 	// jsGlobalLock serialises every call into the quickjs C library -- evals,
 	// calls, gets/sets AND the finalizer-driven frees. QuickJS is not
@@ -895,7 +891,7 @@ var (
 
 func registerContext(c *Context) {
 	registryMu.Lock()
-	ctxRegistry[c.ctxKey()] = c
+	ctxRegistry[c.ctxKey()] = weak.Make(c)
 	registryMu.Unlock()
 }
 
@@ -910,13 +906,23 @@ func lookupContext(p *C.JSContext) *Context {
 		return nil
 	}
 	registryMu.RLock()
-	c := ctxRegistry[uintptr(unsafe.Pointer(p))]
+	c := ctxRegistry[uintptr(unsafe.Pointer(p))].Value()
 	registryMu.RUnlock()
 	return c
 }
 
 func (c *Context) ctxKey() uintptr {
 	return uintptr(unsafe.Pointer(c.c))
+}
+
+// liveRuntimeCount reports how many runtimes are currently tracked. It exists
+// only so internal tests can observe finalizer behaviour; production code never
+// needs the count. It locks runtimeLifeMu because every real access to
+// liveRuntimes is serialised by that mutex.
+func liveRuntimeCount() int {
+	runtimeLifeMu.Lock()
+	defer runtimeLifeMu.Unlock()
+	return len(liveRuntimes)
 }
 
 // ---------------------------------------------------------------------------

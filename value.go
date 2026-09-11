@@ -10,6 +10,7 @@ import (
 	"math"
 	"runtime"
 	"unsafe"
+	"weak"
 )
 
 // Value is a javascript value owned by golang. It stays valid until Free is
@@ -37,7 +38,7 @@ func (v *Value) Free() {
 	v.freed = true
 	if !ctx.closed {
 		C.JS_FreeValue(ctx.c, v.v)
-		delete(ctx.values, v)
+		delete(ctx.values, weak.Make(v))
 	}
 	v.ctx = nil
 	runtime.SetFinalizer(v, nil)
