@@ -131,37 +131,11 @@ func mapKeyString(rv reflect.Value, mk reflect.Value) string {
 	return fmt.Sprintf("%v", mk.Interface())
 }
 
-// methodNames returns the js-spelled names of the exported methods reachable
-// on rv (matching typeMethod's resolution: key, then upperFirst(key)).
-func methodNames(rv reflect.Value) []string {
-	target := rv
-	if target.CanAddr() {
-		target = target.Addr()
-	}
-	t := target.Type()
-	seen := make(map[string]bool)
-	var names []string
-	for i := 0; i < t.NumMethod(); i++ {
-		m := t.Method(i).Name
-		// only exported methods are reported by MethodByName; skip synthetic
-		// toString/valueOf which we surface separately on plain js access.
-		if m == "toString" || m == "valueOf" {
-			continue
-		}
-		js := lowerFirst(m)
-		if !seen[js] {
-			seen[js] = true
-			names = append(names, js)
-		}
-	}
-	return names
-}
-
-// goObjKeysInner enumerates the property names that get/has would resolve on a
-// proxied golang value: data keys (map keys, slice/array indices, struct
-// fields) first, then the js-spelled method names of a named type. The
-// synthetic toString/valueOf are excluded because real js objects expose them
-// as non-enumerable.
+// goObjKeysInner enumerates the data keys of a proxied golang value: map
+// keys, slice/array indices, and struct fields. Methods of a named type are
+// intentionally NOT listed -- Object.keys/values/entries only reports data
+// keys, callable methods stay accessible via property access (e.g. q.get('p'))
+// but are not enumerable.
 func goObjKeysInner(rv reflect.Value) []string {
 	rv = derefValue(rv)
 	if !rv.IsValid() {
@@ -192,9 +166,6 @@ func goObjKeysInner(rv reflect.Value) []string {
 				add(f.Name)
 			}
 		}
-	}
-	for _, m := range methodNames(rv) {
-		add(m)
 	}
 	return keys
 }

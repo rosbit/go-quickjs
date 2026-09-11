@@ -108,8 +108,9 @@ func TestProxyObjectKeys(t *testing.T) {
 }
 
 // TestProxyNamedTypeKeys ensures a named map/slice/struct type (e.g.
-// net/url.Values) enumerates both its data keys and its js-spelled method
-// names.
+// net/url.Values) enumerates ONLY its data keys via Object.keys (methods are
+// intentionally not enumerable), while methods stay callable via property
+// access.
 func TestProxyNamedTypeKeys(t *testing.T) {
 	v := url.Values{}
 	v.Set("p", "crm")
@@ -137,9 +138,15 @@ func TestProxyNamedTypeKeys(t *testing.T) {
 	for _, k := range keys {
 		kset[k] = true
 	}
-	for _, want := range []string{"p", "r", "get", "set", "encode", "has"} {
+	for _, want := range []string{"p", "r"} {
 		if !kset[want] {
 			t.Errorf("Object.keys(q) = %v, missing %q", keys, want)
+		}
+	}
+	// methods must NOT be enumerable
+	for _, notWant := range []string{"get", "set", "encode", "has"} {
+		if kset[notWant] {
+			t.Errorf("Object.keys(q) = %v, unexpected method key %q", keys, notWant)
 		}
 	}
 
