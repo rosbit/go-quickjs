@@ -144,12 +144,15 @@ func structField(rv reflect.Value, key string) (reflect.Value, bool) {
 	return reflect.Value{}, false
 }
 
-// structMethod finds an exported method by the js spelling (see upperFirst).
-// Methods are looked up on the pointer when possible, so that
-// pointer-receiver methods are part of the method set.
-func structMethod(rv reflect.Value, key string) (reflect.Value, bool) {
+// typeMethod finds an exported method of rv by the js spelling (see
+// upperFirst). Methods are looked up on the address when possible, so that
+// pointer-receiver methods are part of the method set. This works for any
+// named golang type -- not just structs -- so a named map/slice/array type
+// such as net/url.Values can expose its methods (Get/Set/Add/Del/Encode/...)
+// to javascript.
+func typeMethod(rv reflect.Value, key string) (reflect.Value, bool) {
 	target := rv
-	if target.Kind() == reflect.Struct && target.CanAddr() {
+	if target.CanAddr() {
 		target = target.Addr()
 	}
 	for _, k := range []string{key, upperFirst(key)} {
@@ -197,8 +200,19 @@ func goObjGetInner(c *Context, rv reflect.Value, key string) C.JSValue {
 			return f
 		}
 	}
+	// A named type (e.g. net/url.Values, a `type Values map[...]...`) is a
+	// distinct type with its own method set; it is NOT merely "a map/slice".
+	// Its methods are therefore the primary interface and are tried first,
+	// before the generic key/index access of the underlying kind.
 	switch rv.Kind() {
 	case reflect.Map:
+		if mv, ok := typeMethod(rv, key); ok {
+			f, err := registerGoFunc(c, mv)
+			if err == nil {
+				nameGoFunc(c, f, goFuncName(mv))
+				return f
+			}
+		}
 		if mv, ok := mapKeyOf(rv, key); ok {
 			ev, err := reflectToJs(c, mv)
 			if err != nil {
@@ -207,6 +221,13 @@ func goObjGetInner(c *Context, rv reflect.Value, key string) C.JSValue {
 			return ev
 		}
 	case reflect.Slice, reflect.Array:
+		if mv, ok := typeMethod(rv, key); ok {
+			f, err := registerGoFunc(c, mv)
+			if err == nil {
+				nameGoFunc(c, f, goFuncName(mv))
+				return f
+			}
+		}
 		if key == "length" || key == "size" {
 			return C.qjs_new_int64(c.c, C.int64_t(rv.Len()))
 		}
@@ -228,7 +249,7 @@ func goObjGetInner(c *Context, rv reflect.Value, key string) C.JSValue {
 			}
 			return ev
 		}
-		if mv, ok := structMethod(rv, key); ok {
+		if mv, ok := typeMethod(rv, key); ok {
 			f, err := registerGoFunc(c, mv)
 			if err != nil {
 				return C.qjs_undefined()
@@ -251,9 +272,15 @@ func goObjHasInner(rv reflect.Value, key string) bool {
 	}
 	switch rv.Kind() {
 	case reflect.Map:
+		if _, ok := typeMethod(rv, key); ok {
+			return true
+		}
 		_, ok := mapKeyOf(rv, key)
 		return ok
 	case reflect.Slice, reflect.Array:
+		if _, ok := typeMethod(rv, key); ok {
+			return true
+		}
 		if key == "length" || key == "size" {
 			return true
 		}
@@ -263,7 +290,7 @@ func goObjHasInner(rv reflect.Value, key string) bool {
 		if _, ok := structField(rv, key); ok {
 			return true
 		}
-		_, ok := structMethod(rv, key)
+		_, ok := typeMethod(rv, key)
 		return ok
 	}
 	return false
