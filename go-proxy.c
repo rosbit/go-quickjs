@@ -14,7 +14,12 @@
 extern int goObjHas(JSContext *ctx, JSValueConst obj, JSAtom atom);
 extern JSValue goObjGet(JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst receiver);
 extern int goObjSet(JSContext *ctx, JSValueConst obj, JSAtom atom, JSValueConst value, JSValueConst receiver, int flags);
+extern int goObjKeysCount(JSContext *ctx, JSValueConst obj);
+extern void goObjKeysFill(JSContext *ctx, JSValueConst obj, JSPropertyEnum *tab, int n);
 extern void goFreeId(JSContext *ctx, uint32_t idx);
+
+int restoreGoObjIdx(JSValueConst val, uint32_t *idx);
+
 
 typedef struct {
     uint32_t idx;
@@ -31,11 +36,55 @@ static void go_obj_finalizer(JSRuntime *rt, JSValue val) {
     free(o);
 }
 
+static int go_obj_get_own_property(JSContext *ctx, JSPropertyDescriptor *desc,
+                                    JSValueConst obj, JSAtom prop) {
+    if (!goObjHas(ctx, obj, prop)) {
+        return 0;
+    }
+    JSValue v = goObjGet(ctx, obj, prop, obj);
+    if (JS_IsException(v)) {
+        return -1;
+    }
+    desc->flags = JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_NORMAL;
+    desc->value = v;
+    desc->getter = JS_UNDEFINED;
+    desc->setter = JS_UNDEFINED;
+    return 1;
+}
+
+static int go_obj_get_own_property_names(JSContext *ctx, JSPropertyEnum **ptab,
+                                         uint32_t *plen, JSValueConst obj) {
+    uint32_t idx;
+    if (!restoreGoObjIdx(obj, &idx)) {
+        *ptab = NULL;
+        *plen = 0;
+        return 0;
+    }
+    int n = goObjKeysCount(ctx, obj);
+    if (n < 0) {
+        return -1;
+    }
+    if (n == 0) {
+        *ptab = NULL;
+        *plen = 0;
+        return 0;
+    }
+    JSPropertyEnum *tab = js_malloc(ctx, sizeof(JSPropertyEnum) * n);
+    if (!tab) {
+        return -1;
+    }
+    memset(tab, 0, sizeof(JSPropertyEnum) * n);
+    goObjKeysFill(ctx, obj, tab, n);
+    *ptab = tab;
+    *plen = (uint32_t)n;
+    return 0;
+}
+
 static JSClassExoticMethods go_obj_exotic = {
-    .get_own_property = NULL,
+    .get_own_property = go_obj_get_own_property,
     .define_own_property = NULL,
     .delete_property = NULL,
-    .get_own_property_names = NULL,
+    .get_own_property_names = go_obj_get_own_property_names,
     .has_property = goObjHas,
     .get_property = goObjGet,
     .set_property = goObjSet,

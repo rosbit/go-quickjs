@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"sync"
 	"unicode"
+	"unsafe"
 )
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,86 @@ func upperFirst(s string) string {
 	rs := []rune(s)
 	rs[0] = unicode.ToUpper(rs[0])
 	return string(rs)
+}
+
+// mapKeyString renders a golang map key as the js spelling that mapKeyOf /
+// atomKey would round-trip back into a golang value.
+func mapKeyString(rv reflect.Value, mk reflect.Value) string {
+	if mk.Type().Kind() == reflect.String {
+		return mk.String()
+	}
+	if mk.Type().ConvertibleTo(reflect.TypeOf("")) {
+		return mk.Convert(reflect.TypeOf("")).String()
+	}
+	return fmt.Sprintf("%v", mk.Interface())
+}
+
+// methodNames returns the js-spelled names of the exported methods reachable
+// on rv (matching typeMethod's resolution: key, then upperFirst(key)).
+func methodNames(rv reflect.Value) []string {
+	target := rv
+	if target.CanAddr() {
+		target = target.Addr()
+	}
+	t := target.Type()
+	seen := make(map[string]bool)
+	var names []string
+	for i := 0; i < t.NumMethod(); i++ {
+		m := t.Method(i).Name
+		// only exported methods are reported by MethodByName; skip synthetic
+		// toString/valueOf which we surface separately on plain js access.
+		if m == "toString" || m == "valueOf" {
+			continue
+		}
+		js := lowerFirst(m)
+		if !seen[js] {
+			seen[js] = true
+			names = append(names, js)
+		}
+	}
+	return names
+}
+
+// goObjKeysInner enumerates the property names that get/has would resolve on a
+// proxied golang value: data keys (map keys, slice/array indices, struct
+// fields) first, then the js-spelled method names of a named type. The
+// synthetic toString/valueOf are excluded because real js objects expose them
+// as non-enumerable.
+func goObjKeysInner(rv reflect.Value) []string {
+	rv = derefValue(rv)
+	if !rv.IsValid() {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var keys []string
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		for _, mk := range rv.MapKeys() {
+			add(mapKeyString(rv, mk))
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < rv.Len(); i++ {
+			add(strconv.Itoa(i))
+		}
+	case reflect.Struct:
+		t := rv.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath == "" { // exported field
+				add(f.Name)
+			}
+		}
+	}
+	for _, m := range methodNames(rv) {
+		add(m)
+	}
+	return keys
 }
 
 // derefValue follows pointers and interfaces down to the addressed value.
@@ -412,6 +493,39 @@ func goObjSet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, value C.JSVal
 //export goFreeId
 func goFreeId(ctx *C.JSContext, idx C.uint32_t) {
 	goObjs.remove(uint32(idx))
+}
+
+//export goObjKeysCount
+func goObjKeysCount(ctx *C.JSContext, obj C.JSValueConst) C.int {
+	c := lookupContext(ctx)
+	if c == nil {
+		return 0
+	}
+	rv, ok := goObjReflect(c, obj)
+	if !ok {
+		return 0
+	}
+	return C.int(len(goObjKeysInner(rv)))
+}
+
+//export goObjKeysFill
+func goObjKeysFill(ctx *C.JSContext, obj C.JSValueConst, tab *C.JSPropertyEnum, n C.int) {
+	c := lookupContext(ctx)
+	if c == nil || n <= 0 {
+		return
+	}
+	rv, ok := goObjReflect(c, obj)
+	if !ok {
+		return
+	}
+	keys := goObjKeysInner(rv)
+	arr := unsafe.Slice((*C.JSPropertyEnum)(tab), int(n))
+	for i := 0; i < int(n) && i < len(keys); i++ {
+		cs := C.CString(keys[i])
+		arr[i].atom = C.JS_NewAtom(ctx, cs)
+		C.free(unsafe.Pointer(cs))
+		arr[i].is_enumerable = 1
+	}
 }
 
 // ---------------------------------------------------------------------------
