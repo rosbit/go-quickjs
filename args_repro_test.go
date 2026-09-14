@@ -8,7 +8,7 @@ import (
 // os.Args[1:] is []string; passing the whole slice to a JS function that
 // expects a single string reproduces the user's scenario.
 func TestOsArgsSliceAsMonthString(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestOsArgsSliceAsMonthString(t *testing.T) {
 }
 
 func TestSliceToStringRendering(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

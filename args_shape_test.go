@@ -6,7 +6,7 @@ import "testing"
 // ONE extra argument; js does Array.prototype.slice.call(arguments, 5) and
 // month = args[0].
 func TestCountStaffInMonthArgs(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

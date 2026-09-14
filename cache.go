@@ -141,7 +141,7 @@ func newContextFromFile(path string, vars map[string]interface{}, opts []Option,
 	all = append(all, WithModulePaths(scriptHome...))
 	all = append(all, opts...)
 
-	ctx, err := New(all...)
+	ctx, err := NewContext(all...)
 	if err != nil {
 		return nil, err
 	}

@@ -172,7 +172,7 @@ func WithConsoleWriter(stdout, stderr io.Writer) Option {
 
 // New creates a jsRuntime together with its single Context and returns the
 // Context. It is the same object the underlying jsRuntime hosts (1:1).
-func New(opts ...Option) (*Context, error) {
+func NewContext(opts ...Option) (*Context, error) {
 	return newRuntime(opts...)
 }
 

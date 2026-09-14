@@ -36,7 +36,7 @@ func TestProxyObjectKeys(t *testing.T) {
 		return out
 	}
 
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestProxyNamedTypeKeys(t *testing.T) {
 	v.Set("p", "crm")
 	v.Set("r", "https://example.com")
 
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

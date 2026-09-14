@@ -10,7 +10,7 @@ import (
 // to javascript -- it is not "just a map". Method lookup is tried before the
 // underlying key/index access, while data access still works as a fallback.
 func TestValuesProxyMethods(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

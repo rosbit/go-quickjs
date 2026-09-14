@@ -18,7 +18,7 @@ import (
 func TestFinalizerReclaim(t *testing.T) {
 	before := liveRuntimeCount()
 	for i := 0; i < 50; i++ {
-		ctx, err := New()
+		ctx, err := NewContext()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -44,7 +44,7 @@ func TestFinalizerReclaim(t *testing.T) {
 // TestContextGC exercises the Context.GC helper, the public entry point that
 // replaced the unexported Runtime.GC when Runtime was folded into jsRuntime.
 func TestContextGC(t *testing.T) {
-	ctx, err := New()
+	ctx, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

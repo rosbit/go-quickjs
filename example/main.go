@@ -52,7 +52,7 @@ var (
 )
 
 func main() {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		fmt.Printf("new: %v\n", err)
 		return

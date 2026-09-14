@@ -5,7 +5,7 @@ import "testing"
 // monthString is a plain go string; regex.test(monthString) must work both
 // when passed as a call argument and when set as a global.
 func TestGoStringRegexTest(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

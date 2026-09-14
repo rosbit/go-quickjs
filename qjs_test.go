@@ -47,7 +47,7 @@ async function later(x) { return await Promise.resolve(x * 2); }
 
 func newCtx(t *testing.T, code string) *qjs.Context {
 	t.Helper()
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -66,7 +66,7 @@ func newCtx(t *testing.T, code string) *qjs.Context {
 // ---------------------------------------------------------------------------
 
 func TestEval(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestRunFileEntry(t *testing.T) {
 	if err := os.WriteFile(path, []byte("function entry(x){return x*3}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestModuleImport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestModuleImport(t *testing.T) {
 }
 
 func TestCustomModuleLoader(t *testing.T) {
-	ctx, err := qjs.New(qjs.WithModuleLoader(func(name string) ([]byte, error) {
+	ctx, err := qjs.NewContext(qjs.WithModuleLoader(func(name string) ([]byte, error) {
 		if name != "virtual.js" {
 			return nil, fmt.Errorf("no such module: %s", name)
 		}
@@ -345,7 +345,7 @@ func TestErrorType(t *testing.T) {
 }
 
 func TestSyntaxError(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestCreateCloseStress(t *testing.T) {
 // quickjs_test and cannot. Kept here only as a no-crash smoke test.
 func TestFinalizerReclaimSmoke(t *testing.T) {
 	for i := 0; i < 50; i++ {
-		ctx, err := qjs.New()
+		ctx, err := qjs.NewContext()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -444,7 +444,7 @@ func TestConcurrentContexts(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			ctx, err := qjs.New()
+			ctx, err := qjs.NewContext()
 			if err != nil {
 				t.Error(err)
 				return
@@ -474,7 +474,7 @@ func TestConcurrentContexts(t *testing.T) {
 
 // a golang function called from javascript may call back into javascript
 func TestNestedCalls(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +517,7 @@ func TestNestedCalls(t *testing.T) {
 }
 
 func TestGlobalGetSet(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +651,7 @@ func TestModuleSearchPath(t *testing.T) {
 		"import {quad} from 'pkg';\n"+
 		"globalThis.run = (x) => twice(x) + quad(x);\n")
 
-	ctx, err := qjs.New(qjs.WithModulePaths(libDir))
+	ctx, err := qjs.NewContext(qjs.WithModulePaths(libDir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,7 +679,7 @@ func TestModuleNextToEntry(t *testing.T) {
 	write(filepath.Join(dir, "helper.js"), "export const v = 7\n")
 	write(filepath.Join(dir, "main.js"), "import {v} from 'helper';\nglobalThis.run = () => v;\n")
 
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,7 +703,7 @@ func TestModuleNotFound(t *testing.T) {
 	if err := os.WriteFile(app, []byte("import {v} from 'nowhere';\nglobalThis.run = () => v;\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +814,7 @@ globalThis.counted = () => { const c = require('./counter'); return c.next(); };
 	write(filepath.Join(dir, "counter.js"),
 		"let n = 0;\nexports.next = () => ++n;\n")
 
-	ctx, err := qjs.New(qjs.WithRequire())
+	ctx, err := qjs.NewContext(qjs.WithRequire())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +868,7 @@ func TestRequireSearchPath(t *testing.T) {
 	main := filepath.Join(dir, "main.js")
 	write(main, "const s = require('shared');\nglobalThis.run = () => s.tag;\n")
 
-	ctx, err := qjs.New(qjs.WithRequire(), qjs.WithModulePaths(lib))
+	ctx, err := qjs.NewContext(qjs.WithRequire(), qjs.WithModulePaths(lib))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +888,7 @@ func TestRequireNotFound(t *testing.T) {
 	if err := os.WriteFile(main, []byte("require('nope-not-here');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, err := qjs.New(qjs.WithRequire())
+	ctx, err := qjs.NewContext(qjs.WithRequire())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -902,7 +902,7 @@ func TestRequireNotFound(t *testing.T) {
 
 // require is not installed unless asked for
 func TestRequireDisabledByDefault(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -996,7 +996,7 @@ func TestFileCacheHasRequire(t *testing.T) {
 // first-letter toggle: json tags play no role, and multi-letter camel forms
 // (a.nickname for Nick) do not match.
 func TestLowerCamelNames(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1052,7 +1052,7 @@ func TestLowerCamelNames(t *testing.T) {
 
 // a javascript object spelled in lower camel fills the go struct
 func TestLowerCamelArgs(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1085,7 @@ func TestLowerCamelArgs(t *testing.T) {
 // nested values: maps inside maps, structs inside maps/slices/structs
 
 func TestNestedMaps(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1137,7 +1137,7 @@ type nestedTeam struct {
 // methods survive one level down: a struct reached through a field, a slice
 // element or a map value must keep them
 func TestNestedStructMethods(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1179,7 +1179,7 @@ func TestNestedStructMethods(t *testing.T) {
 // a struct returned by value keeps its methods too: the value is copied, so
 // that pointer receiver methods have something to bind to
 func TestStructValueMethods(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1208,7 @@ func TestStructValueMethods(t *testing.T) {
 // a value that refers back to itself is cut off instead of recursing for
 // ever: the expansion is bounded, so the walk ends at a null
 func TestSelfReferentialStruct(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1257,7 +1257,7 @@ func TestSelfReferentialStruct(t *testing.T) {
 // must not grow either: no javascript object may be left behind by one round
 // of setting.
 func TestRepeatedSet(t *testing.T) {
-	ctx, err := qjs.New()
+	ctx, err := qjs.NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

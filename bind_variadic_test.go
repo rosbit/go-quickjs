@@ -11,7 +11,7 @@ import (
 type fnPushLike func(name string, n int, updating bool, args ...string) string
 
 func TestBindFuncVariadicSpread(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestBindFuncVariadicSpread(t *testing.T) {
 type fnVariadicIface func(prefix string, args ...interface{}) string
 
 func TestBindFuncVariadicSliceElementStaysWhole(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

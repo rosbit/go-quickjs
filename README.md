@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-  ctx, err := quickjs.New()
+  ctx, err := quickjs.NewContext()
   if err != nil {
     fmt.Printf("%v\n", err)
     return
@@ -65,7 +65,7 @@ import (
 var add func(int, int)int
 
 func main() {
-  ctx, err := quickjs.New()
+  ctx, err := quickjs.NewContext()
   if err != nil {
      fmt.Printf("%v\n", err)
      return
@@ -113,7 +113,7 @@ func adder(a1 float64, a2 float64) float64 {
 }
 
 func main() {
-  ctx, err := quickjs.New()
+  ctx, err := quickjs.NewContext()
   if err != nil {
       fmt.Printf("%v\n", err)
       return

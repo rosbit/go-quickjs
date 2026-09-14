@@ -23,7 +23,7 @@ type itHolder struct {
 // SetAll must support nested maps: a value of type map[string]interface{}
 // keeps every level accessible with plain javascript syntax.
 func TestSetAllNestedMaps(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestSetAllNestedMaps(t *testing.T) {
 // a go function returning a struct pointer must give javascript an object
 // whose methods are callable, at any nesting depth.
 func TestStructMethodsFromGoFunc(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestStructMethodsFromGoFunc(t *testing.T) {
 // and methods must show as [Function: Name], never as undefined.
 func TestConsoleLogRendersMethods(t *testing.T) {
 	var sb strings.Builder
-	c, err := New(WithConsoleWriter(&sb, &sb))
+	c, err := NewContext(WithConsoleWriter(&sb, &sb))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestConsoleLogRendersMethods(t *testing.T) {
 // handed back to a golang function arrives as the original value itself
 // (zero copy, not a copy of it).
 func TestProxyWriteBackAndRoundTrip(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestProxyWriteBackAndRoundTrip(t *testing.T) {
 // string (RegExp.prototype.test and friends) all go through ToPrimitive.
 // Without toString/valueOf on the proxy those threw TypeError: toPrimitive.
 func TestProxyToPrimitive(t *testing.T) {
-	c, err := New()
+	c, err := NewContext()
 	if err != nil {
 		t.Fatal(err)
 	}

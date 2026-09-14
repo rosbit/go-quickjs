@@ -81,7 +81,7 @@ func TestConsoleColor(t *testing.T) {
 // upstream pretty-printer (JS_PrintValue) when they arrive as *Value.
 func TestConsoleLogJsPrettyPrint(t *testing.T) {
 	var sb strings.Builder
-	c, err := New(WithConsoleWriter(&sb, &sb))
+	c, err := NewContext(WithConsoleWriter(&sb, &sb))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestConsoleLogJsPrettyPrint(t *testing.T) {
 // upstream JS-literal style ({ Name: pp }); exotic types still use Pretty.
 func TestConsoleLogPlainObjectJson(t *testing.T) {
 	var sb strings.Builder
-	c, err := New(WithConsoleWriter(&sb, &sb))
+	c, err := NewContext(WithConsoleWriter(&sb, &sb))
 	if err != nil {
 		t.Fatal(err)
 	}
