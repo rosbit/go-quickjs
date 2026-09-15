@@ -35,7 +35,7 @@ func (e *Error) Error() string {
 func (e *Error) StackTrace() string { return e.Stack }
 
 // takeError consumes the pending exception of the context and converts it to a
-// golang error. It must be called with the context lock held.
+// golang error. It must be called with jsGlobalLock held.
 func (c *Context) takeError() error {
 	ex := C.qjs_get_exception(c.c)
 	if C.qjs_is_undefined(ex) != 0 || C.qjs_is_null(ex) != 0 {

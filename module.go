@@ -58,7 +58,7 @@ var moduleExts = []string{"", ".js", ".mjs", ".cjs"}
 // the entry file, then every directory configured with WithModulePaths.
 //
 // It is called from the quickjs loader callback, i.e. while the caller already
-// holds the context lock, so the two dir fields need no extra guard.
+// holds jsGlobalLock, so the two dir fields need no extra guard.
 func (c *Context) loadModuleFile(name string) ([]byte, error) {
 	path, err := c.resolveModule(name)
 	if err != nil {

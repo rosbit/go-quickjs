@@ -131,8 +131,6 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 		return C.qjs_throw_error(ctx, ccstr("qjs: go function no longer available"))
 	}
 
-	c.lock.lock()
-	defer c.lock.unlock()
 	if c.closed {
 		return C.qjs_undefined()
 	}
@@ -253,8 +251,6 @@ func toJsResult(c *Context, v reflect.Value) C.JSValue {
 func (c *Context) BindFunc(name string, fnVarPtr interface{}) error {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	c.lock.lock()
-	defer c.lock.unlock()
 	if c.closed {
 		return ErrClosed
 	}
@@ -295,8 +291,6 @@ func (v *Value) Bind(fnVarPtr interface{}) error {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
 		return errNotFunc
 	}
@@ -330,8 +324,6 @@ func (c *Context) bindFuncValue(jsFn C.JSValue, fnVarPtr interface{}) error {
 func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value) []reflect.Value {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	c.lock.lock()
-	defer c.lock.unlock()
 
 	zero := func() []reflect.Value {
 		res := make([]reflect.Value, ft.NumOut())

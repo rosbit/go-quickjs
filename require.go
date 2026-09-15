@@ -75,15 +75,12 @@ const requireBootstrap = `(function () {
 })();
 `
 
-// installRequire adds a CommonJS require() to the global object. It is called
-// with jsGlobalLock and the context lock held (the lock is reentrant so the
-// nested eval is fine); it takes both here for consistency with every other
-// quickjs C entry point.
+// installRequire adds a CommonJS require() to the global object. It takes
+// jsGlobalLock itself (the lock is reentrant, so the nested eval is fine), like
+// every other quickjs C entry point.
 func installRequire(c *Context) {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	c.lock.lock()
-	defer c.lock.unlock()
 
 	global := C.qjs_global(c.c)
 	if C.JS_IsException(global) != 0 {

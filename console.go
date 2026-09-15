@@ -65,8 +65,6 @@ func isTerminalWriter(w io.Writer) bool {
 func installBuiltins(c *Context) {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	c.lock.lock()
-	defer c.lock.unlock()
 
 	stdout, stderr := c.rt.stdout, c.rt.stderr
 	if stdout == nil {
@@ -122,7 +120,8 @@ func logWriter(w io.Writer) func(args ...*Value) {
 	}
 }
 
-func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {	fv, err := registerGoFunc(c, reflect.ValueOf(fn))
+func defineGoFunc(c *Context, obj C.JSValue, name string, fn interface{}) {
+	fv, err := registerGoFunc(c, reflect.ValueOf(fn))
 	if err != nil {
 		return
 	}

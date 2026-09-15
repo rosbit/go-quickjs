@@ -30,8 +30,6 @@ func (v *Value) Free() {
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
 	ctx := v.ctx
-	ctx.lock.lock()
-	defer ctx.lock.unlock()
 	if v.freed {
 		return
 	}
@@ -59,8 +57,6 @@ func (v *Value) Freed() bool {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	return v.freed || v.ctx.closed
 }
 
@@ -118,8 +114,6 @@ func (v *Value) test(f func() bool) bool {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if v.freed || v.ctx.closed {
 		return false
 	}
@@ -133,8 +127,6 @@ func (v *Value) Bool() bool {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	return C.JS_ToBool(v.ctx.c, v.v) != 0
 }
 
@@ -145,8 +137,6 @@ func (v *Value) Int64() int64 {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	var i C.int64_t
 	C.JS_ToInt64(v.ctx.c, &i, v.v)
 	return int64(i)
@@ -159,8 +149,6 @@ func (v *Value) Float64() float64 {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	var f C.double
 	C.JS_ToFloat64(v.ctx.c, &f, v.v)
 	return float64(f)
@@ -174,8 +162,6 @@ func (v *Value) String() string {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if C.qjs_is_string(v.v) != 0 {
 		return cGoString(v.ctx.c, v.v)
 	}
@@ -195,8 +181,6 @@ func (v *Value) Interface() (interface{}, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if v.freed || v.ctx.closed {
 		return nil, ErrFreed
 	}
@@ -210,8 +194,6 @@ func (v *Value) JSON() (string, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	return jsonStringify(v.ctx, v.v)
 }
 
@@ -227,8 +209,6 @@ func (v *Value) Pretty() string {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	var cstr *C.char
 	var clen C.size_t
 	C.qjs_print_value(v.ctx.c, v.v, &cstr, &clen)
@@ -266,8 +246,6 @@ func (v *Value) isPlainJs() bool {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if v.freed || v.ctx.closed {
 		return false
 	}
@@ -285,8 +263,6 @@ func (v *Value) Get(key string) (*Value, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	ckey := C.CString(key)
 	prop := C.qjs_get_prop(v.ctx.c, v.v, ckey)
 	C.free(unsafe.Pointer(ckey))
@@ -300,8 +276,6 @@ func (v *Value) Set(key string, val interface{}) error {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	jv, err := toJsValue(v.ctx, val)
 	if err != nil {
 		return err
@@ -322,8 +296,6 @@ func (v *Value) Call(args ...interface{}) (*Value, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
 		return nil, errNotFunc
 	}
@@ -337,8 +309,6 @@ func (v *Value) CallMethod(name string, args ...interface{}) (*Value, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	cname := C.CString(name)
 	fn := C.qjs_get_prop(v.ctx.c, v.v, cname)
 	C.free(unsafe.Pointer(cname))
@@ -361,8 +331,6 @@ func (v *Value) Keys() ([]string, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	return propertyNames(v.ctx, v.v)
 }
 
@@ -373,8 +341,6 @@ func (v *Value) Length() int {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	if C.qjs_is_array(v.ctx.c, v.v) == 0 {
 		return 0
 	}
@@ -390,8 +356,6 @@ func (v *Value) Elem(i int) (*Value, error) {
 	}
 	jsGlobalLock.lock()
 	defer jsGlobalLock.unlock()
-	v.ctx.lock.lock()
-	defer v.ctx.lock.unlock()
 	e := C.qjs_get_prop_u32(v.ctx.c, v.v, C.uint32_t(i))
 	return v.ctx.wrapGet(e)
 }

@@ -472,6 +472,57 @@ func TestConcurrentContexts(t *testing.T) {
 	wg.Wait()
 }
 
+// A single Context shared by several goroutines must stay race-free: after
+// collapsing the redundant per-Context / per-runtime mutexes, the one global
+// lock is what serialises every entry point. Run under -race, this exercises
+// Eval, Closed and GC concurrently on the same context and checks the shared
+// javascript state stayed consistent.
+func TestConcurrentSharedContext(t *testing.T) {
+	ctx, err := qjs.NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	if _, err := ctx.Eval(`globalThis.n = 0`, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 8
+	const rounds = 100
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < rounds; j++ {
+				v, err := ctx.Eval(`(function(){ globalThis.n++; return n; })()`, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_, _ = v.Interface()
+				v.Free()
+				// touch the other serialised entry points too
+				_ = ctx.Closed()
+				ctx.GC()
+			}
+		}()
+	}
+	wg.Wait()
+
+	res, err := ctx.Eval(`n`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := res.Interface()
+	res.Free()
+	if got != int64(workers*rounds) {
+		t.Fatalf("shared counter n = %v, want %d", got, workers*rounds)
+	}
+}
+
 // a golang function called from javascript may call back into javascript
 func TestNestedCalls(t *testing.T) {
 	ctx, err := qjs.NewContext()
@@ -1013,18 +1064,18 @@ func TestLowerCamelNames(t *testing.T) {
 	}
 
 	for js, want := range map[string]string{
-		`a.name`:         "gopher",  // first letter toggled: name finds Name
-		`a.Name`:         "gopher",  // the go name as it is
-		`a.userAge`:      "3",       // userAge finds UserAge
-		`a.UserAge`:      "3",
-		`a.ID`:           "7",
-		`a.iD`:           "7", // iD finds ID
-		`a.HTTPStatus`:   "200",
-		`a.hTTPStatus`:   "200",
-		`a.nick`:         "gg", // nick finds Nick
+		`a.name`:            "gopher", // first letter toggled: name finds Name
+		`a.Name`:            "gopher", // the go name as it is
+		`a.userAge`:         "3",      // userAge finds UserAge
+		`a.UserAge`:         "3",
+		`a.ID`:              "7",
+		`a.iD`:              "7", // iD finds ID
+		`a.HTTPStatus`:      "200",
+		`a.hTTPStatus`:      "200",
+		`a.nick`:            "gg",        // nick finds Nick
 		`typeof a.nickName`: "undefined", // the rule is one letter, not camel case
 		`typeof a.nickname`: "undefined",
-		`typeof a.name2`: "undefined",
+		`typeof a.name2`:    "undefined",
 	} {
 		v, err := ctx.Eval(js, nil)
 		if err != nil {
