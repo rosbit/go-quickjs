@@ -2,6 +2,7 @@
 #define QJS_HELPER_H
 
 #include <stdlib.h>
+#include <pthread.h>
 #include "quickjs.h"
 
 /*
@@ -67,6 +68,21 @@ static inline void qjs_stack_guard(JSContext *ctx) {
 }
 static inline void qjs_stack_guard_rt(JSRuntime *rt) {
 	JS_UpdateStackTop(rt);
+}
+
+/* ---- thread identity ---- */
+
+/*
+ * The OS thread the caller is running on. It is used to recognise the one
+ * goroutine that is allowed to re-enter an engine lock it already holds: inside
+ * a cgo callback the M cannot be handed to another goroutine (the C frames
+ * below the callback live on that thread's stack), so a thread id identifies
+ * that goroutine exactly. Anywhere else it does not, because go may move a
+ * goroutine between threads at any preemption point -- which is why the engine
+ * lock only consults it while a callback is in flight.
+ */
+static inline long long qjs_thread_id(void) {
+	return (long long)(intptr_t)pthread_self();
 }
 
 /* ---- constant values ---- */

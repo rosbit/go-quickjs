@@ -75,13 +75,16 @@ const requireBootstrap = `(function () {
 })();
 `
 
-// installRequire adds a CommonJS require() to the global object. It takes the
-// context's engine lock itself (the lock is reentrant, so the nested eval is
-// fine), like every other quickjs C entry point.
+// installRequire adds a CommonJS require() to the global object.
 func installRequire(c *Context) {
 	c.mu.lock()
 	defer c.mu.unlock()
+	installRequireLocked(c)
+}
 
+// installRequireLocked is installRequire without the engine lock: the caller
+// must hold it (installBuiltins does).
+func installRequireLocked(c *Context) {
 	global := C.qjs_global(c.c)
 	if C.JS_IsException(global) != 0 {
 		return
@@ -95,7 +98,7 @@ func installRequire(c *Context) {
 	C.JS_FreeValue(c.c, global)
 
 	// the bootstrap only defines functions, so a failure here is not fatal
-	_, _ = c.evalBytes([]byte(requireBootstrap), "<require>", EvalGlobal, false)
+	_, _ = c.evalBytesLocked([]byte(requireBootstrap), "<require>", EvalGlobal, false)
 }
 
 // cjsResolve turns a module name into a file path, or "" when nothing matches.

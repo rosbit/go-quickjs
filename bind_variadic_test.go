@@ -75,3 +75,64 @@ func TestBindFuncVariadicSliceElementStaysWhole(t *testing.T) {
 		t.Fatalf("slice element collapsed: got %q", got)
 	}
 }
+
+// TestBindFuncCallFromGoReleasesResultLockFree locks in the lock discipline of
+// callJsFunc, which is the one internal path that takes the engine lock and
+// then has to release a *Value.
+//
+// callJsFunc is reached two ways: from a javascript -> golang callback, where
+// it re-enters a lock it already holds and the engine lock recognises that
+// through the callback's OS thread, and directly from golang, where it takes
+// the lock itself. On the second path the lock is held by this very goroutine
+// with no callback in flight, so releasing the result through the locking
+// Value.Free would not be recognised as re-entry and would deadlock on itself
+// forever. It must use Value.freeLocked instead.
+//
+// Every return shape is exercised because each one reaches a different
+// freeLocked call site inside callJsFunc.
+func TestBindFuncCallFromGoReleasesResultLockFree(t *testing.T) {
+	c, err := NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if _, err := c.Eval(`
+	function noOut(a)     { }
+	function oneOut(a)    { return a + 1; }
+	function outAndErr(a) { return a * 2; }
+	function errOnly(a)   { }
+	`, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var noOut func(int)
+	if err := c.BindFunc("noOut", &noOut); err != nil {
+		t.Fatal(err)
+	}
+	noOut(1) // no result
+
+	var oneOut func(int) int
+	if err := c.BindFunc("oneOut", &oneOut); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneOut(41); got != 42 {
+		t.Fatalf("oneOut: got %d, want 42", got)
+	}
+
+	var outAndErr func(int) (int, error)
+	if err := c.BindFunc("outAndErr", &outAndErr); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := outAndErr(21); err != nil || v != 42 {
+		t.Fatalf("outAndErr: got (%d, %v), want (42, nil)", v, err)
+	}
+
+	var errOnly func(int) error
+	if err := c.BindFunc("errOnly", &errOnly); err != nil {
+		t.Fatal(err)
+	}
+	if err := errOnly(1); err != nil {
+		t.Fatalf("errOnly: got %v, want nil", err)
+	}
+}

@@ -409,6 +409,8 @@ func goObjHas(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom) C.int {
 	if c == nil {
 		return 0
 	}
+	c.mu.enterCallback() // see reentrant: marks the goroutine C is calling into
+	defer c.mu.exitCallback()
 	rv, ok := goObjReflect(c, obj)
 	if !ok {
 		return 0
@@ -429,6 +431,8 @@ func goObjGet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, receiver C.JS
 	if c == nil {
 		return C.qjs_undefined()
 	}
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
 	rv, ok := goObjReflect(c, obj)
 	if !ok {
 		return C.qjs_undefined()
@@ -446,6 +450,8 @@ func goObjSet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, value C.JSVal
 	if c == nil {
 		return 0
 	}
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
 	rv, ok := goObjReflect(c, obj)
 	if !ok {
 		return 0
@@ -472,6 +478,8 @@ func goObjKeysCount(ctx *C.JSContext, obj C.JSValueConst) C.int {
 	if c == nil {
 		return 0
 	}
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
 	rv, ok := goObjReflect(c, obj)
 	if !ok {
 		return 0
@@ -485,6 +493,8 @@ func goObjKeysFill(ctx *C.JSContext, obj C.JSValueConst, tab *C.JSPropertyEnum, 
 	if c == nil || n <= 0 {
 		return
 	}
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
 	rv, ok := goObjReflect(c, obj)
 	if !ok {
 		return

@@ -19,6 +19,11 @@ func qjs_load_module(ctx *C.JSContext, name *C.char, outBuf **C.char, outLen *C.
 	if c == nil {
 		return 0
 	}
+	// the loader may be golang code the caller supplied, and it may call back
+	// into this context: mark the callback so the engine lock allows that
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
+
 	modName := C.GoString(name)
 
 	var data []byte

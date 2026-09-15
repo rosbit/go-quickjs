@@ -106,7 +106,7 @@ func installBuiltins(c *Context) {
 	C.JS_FreeValue(c.c, global)
 
 	if c.rt.require {
-		installRequire(c)
+		installRequireLocked(c) // the lock is already held
 	}
 }
 

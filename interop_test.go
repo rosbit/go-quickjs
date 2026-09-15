@@ -11,8 +11,8 @@ type itItem struct {
 	pri  int
 }
 
-func (i *itItem) Upper() string  { return "UPPER:" + i.Name }
-func (i *itItem) Add(n int) int  { return n + 10 }
+func (i *itItem) Upper() string   { return "UPPER:" + i.Name }
+func (i *itItem) Add(n int) int   { return n + 10 }
 func (i *itItem) Rename(s string) { i.Name = s }
 
 type itHolder struct {
@@ -29,13 +29,15 @@ func TestSetAllNestedMaps(t *testing.T) {
 	}
 	defer c.Close()
 
-	err = c.setAll(map[string]interface{}{
+	c.mu.lock()
+	err = c.setAllLocked(map[string]interface{}{
 		"vars": map[string]interface{}{
 			"a":   1,
 			"sub": map[string]interface{}{"b": "bee", "c": 3.5},
 			"arr": []interface{}{map[string]interface{}{"q": 9}},
 		},
 	})
+	c.mu.unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,11 +79,11 @@ func TestStructMethodsFromGoFunc(t *testing.T) {
 	})
 
 	cases := map[string]interface{}{
-		`getItem("x").Name`:            "x",
-		`getItem("x").Upper()`:         "UPPER:x",
-		`getItem("x").add(5)`:          int64(15),
-		`getHolder().Item.Name`:        "held",
-		`getHolder().Item.Upper()`:     "UPPER:held",
+		`getItem("x").Name`:             "x",
+		`getItem("x").Upper()`:          "UPPER:x",
+		`getItem("x").add(5)`:           int64(15),
+		`getHolder().Item.Name`:         "held",
+		`getHolder().Item.Upper()`:      "UPPER:held",
 		`typeof getHolder().Item.Upper`: "function",
 	}
 	for code, want := range cases {
@@ -176,16 +178,18 @@ func TestProxyToPrimitive(t *testing.T) {
 	defer c.Close()
 
 	type month struct{ S string }
-	c.setAll(map[string]interface{}{
+	c.mu.lock()
+	_ = c.setAllLocked(map[string]interface{}{
 		"data":  map[string]interface{}{"m": "2026-09"},
 		"m2":    month{S: "2026-09"},
 		"stamp": time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
 		"list":  []string{"a", "b"},
 	})
+	c.mu.unlock()
 
 	cases := map[string]string{
-		`String(m2)`:   "{2026-09}", // fmt %v of the struct
-		`'' + m2`:      "{2026-09}",
+		`String(m2)`:    "{2026-09}", // fmt %v of the struct
+		`'' + m2`:       "{2026-09}",
 		`String(stamp)`: "2026-09-08T10:00:00Z", // time.Time travels as an RFC3339 string, not a proxy
 		`String(list)`:  "[a b]",
 		`typeof data.m`: "string", // strings inside a proxy stay js strings

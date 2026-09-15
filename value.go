@@ -36,9 +36,22 @@ func (v *Value) Free() {
 	}
 	c.mu.lock()
 	defer c.mu.unlock()
-	if v.freed || v.ctx == nil {
+	v.freeLocked()
+}
+
+// freeLocked is Free for a caller that already holds the engine lock, and it is
+// the *only* form an internal caller may use. The engine lock recognises
+// re-entry by the OS thread of a javascript -> golang callback, not by
+// goroutine identity, so a goroutine that took the lock itself and then calls a
+// locking method again would not be recognised and would deadlock on itself.
+// Every internal path that frees a value while holding the lock must therefore
+// go through this helper. callJsFunc is the one such path today: it takes the
+// lock, runs javascript, and then releases the result it wrapped.
+func (v *Value) freeLocked() {
+	if v == nil || v.freed || v.ctx == nil {
 		return
 	}
+	c := v.ctx
 	v.freed = true
 	// A closed context has already freed every JSValue it was holding -- even
 	// ones whose wrapper was still queued for finalization -- so there is nothing

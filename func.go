@@ -125,6 +125,11 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 	if c == nil {
 		return C.qjs_undefined()
 	}
+	// mark the callback so the engine lock recognises the re-entrant call the
+	// golang function may make back into this context
+	c.mu.enterCallback()
+	defer c.mu.exitCallback()
+
 	id := C.qjs_to_uint32(ctx, *funcData)
 	gf := c.rt.funcs.get(uint32(id))
 	if gf == nil || gf.fn.Kind() != reflect.Func {
@@ -363,7 +368,7 @@ func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value)
 	nout := ft.NumOut()
 	if nout == 0 {
 		if res != nil {
-			res.Free()
+			res.freeLocked()
 		}
 		return nil
 	}
@@ -380,14 +385,14 @@ func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value)
 		}
 		if nout == 2 && res != nil {
 			v, e := jsToGo(c, res.v, ft.Out(0))
-			res.Free()
+			res.freeLocked()
 			if e == nil {
 				out[0] = v
 			}
 			return out
 		}
 		if res != nil {
-			res.Free()
+			res.freeLocked()
 		}
 		return out
 	}
@@ -399,7 +404,7 @@ func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value)
 			out[0] = reflect.Zero(errorType)
 		}
 		if res != nil {
-			res.Free()
+			res.freeLocked()
 		}
 		return out
 	}
@@ -415,7 +420,7 @@ func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value)
 		}
 	}
 	if res != nil {
-		res.Free()
+		res.freeLocked()
 	}
 	return out
 }

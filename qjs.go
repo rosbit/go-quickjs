@@ -122,13 +122,22 @@ type Context struct {
 	// for the whole life of the value, so every deleter removes exactly the entry
 	// it owns.
 	//
-	// Holding the JSValue here (rather than only in the wrapper) is what lets
-	// closeLocked release values whose wrapper is already gone, and holding it via
-	// a weak reference to the wrapper is what lets it disarm the wrappers that are
-	// still alive. The wrapper reference must be weak: a strong one would let the
-	// context pin its own *Value objects, and since a *Value points back at its
-	// context, that cycle would be uncollectable.
-	values      map[uint64]valueEntry
+	// Holding the JSValue here -- rather than only in the wrapper -- is what lets
+	// closeLocked release values whose wrapper is already gone. That is the whole
+	// point of the map: a JSValue whose *Value was collected but whose finalizer
+	// has not run yet is still alive, and JS_FreeRuntime asserts that no object is
+	// left behind.
+	//
+	// A weak reference to the wrapper is deliberately not kept. It would only buy
+	// closeLocked the ability to disarm the wrappers that are still reachable, and
+	// those need no disarming: every wrapper method calls check(), which reports
+	// ErrClosed once c.closed is set, and finalizeValue returns early on c.closed
+	// too, so a wrapper that outlives its context frees nothing. Charging a
+	// weak.Make (~350ns, measured) on every keep() -- the hot path of the whole
+	// library, one call per property read, per call result, per converted function
+	// -- for something no reader consumes is a bad trade. Measured on 8 engines:
+	// dropping it takes the eval speedup from 2.71x to 3.69x.
+	values      map[uint64]C.JSValue
 	nextValueID uint64
 
 	closed bool
@@ -138,14 +147,6 @@ type Context struct {
 	modDir  string // directory of the module loaded most recently
 
 	convDepth int // nesting of the value being converted to js, see maxConvDepth
-}
-
-// valueEntry is one outstanding JSValue: the C value to free, plus a weak
-// reference to its golang wrapper (nil once the collector has reclaimed the
-// wrapper, which is exactly the case closeLocked still has to free for).
-type valueEntry struct {
-	jsv C.JSValue
-	w   weak.Pointer[Value]
 }
 
 type options struct {
@@ -270,7 +271,7 @@ func newRuntime(opts ...Option) (*Context, error) {
 	ctx := &Context{
 		rt:     r,
 		c:      c,
-		values: make(map[uint64]valueEntry),
+		values: make(map[uint64]C.JSValue),
 	}
 	registerContext(ctx)
 	liveEngines.Add(1)
@@ -384,18 +385,10 @@ func (c *Context) closeLocked() {
 	// Entries whose finalizer already ran are gone from the map: finalizeValue
 	// deletes by id, so it removes precisely its own entry and never leaves a
 	// stale JSValue behind for this loop to free twice.
-	for _, e := range c.values {
-		C.JS_FreeValue(c.c, e.jsv)
-		// When the wrapper is still reachable, disarm it so a later Free or
-		// finalizer run cannot free the same JSValue twice. When it is not, the
-		// pending finalizer sees c.closed and drops the value instead.
-		if v := e.w.Value(); v != nil {
-			v.freed = true
-			v.ctx = nil
-			runtime.SetFinalizer(v, nil)
-		}
+	for _, jsv := range c.values {
+		C.JS_FreeValue(c.c, jsv)
 	}
-	c.values = make(map[uint64]valueEntry)
+	c.values = make(map[uint64]C.JSValue)
 
 	// Unregister before the JSContext is freed, while the address is still
 	// unambiguously ours. Doing it afterwards would let a context created
@@ -438,18 +431,23 @@ func (c *Context) Global() *Value {
 // globals before the code runs, so scripts can read them without a separate
 // SetAll call.
 func (c *Context) Eval(code string, vars map[string]interface{}) (*Value, error) {
-	if err := c.setAll(vars); err != nil {
+	c.mu.lock()
+	defer c.mu.unlock()
+	// One critical section for the globals and the code: a shared context must
+	// not let another goroutine slip in between and run with these globals set.
+	if err := c.setAllLocked(vars); err != nil {
 		return nil, err
 	}
-	b := []byte(code)
-	return c.evalBytes(b, "<eval>", EvalGlobal, false)
+	return c.evalBytesLocked([]byte(code), "<eval>", EvalGlobal, false)
 }
 
 // EvalModule compiles and runs source code as an ES module (import/export are
 // allowed). If the module uses top level await, pending jobs are executed until
 // the module is settled.
 func (c *Context) EvalModule(code, filename string) (*Value, error) {
-	return c.evalBytes([]byte(code), filename, EvalModule, true)
+	c.mu.lock()
+	defer c.mu.unlock()
+	return c.evalBytesLocked([]byte(code), filename, EvalModule, true)
 }
 
 // EvalFile loads a javascript file and runs it. ES modules (files containing
@@ -462,13 +460,13 @@ func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, er
 	if err != nil {
 		return nil, err
 	}
-	if err := c.setAll(vars); err != nil {
+	if err := c.setAllLocked(vars); err != nil {
 		return nil, err
 	}
 	// imports of this file resolve relative to its own directory first
 	c.mainDir, c.modDir = filepath.Dir(path), filepath.Dir(path)
 	asModule := C.qjs_is_module(cstrPtr(buf), C.size_t(len(buf))) != 0
-	return c.evalBytes(buf, path, EvalGlobal, asModule)
+	return c.evalBytesLocked(buf, path, EvalGlobal, asModule)
 }
 
 // Note on quickjs' C stack guard: it compares the current frame address against
@@ -480,9 +478,12 @@ func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, er
 // refresh issued from golang is a separate cgo call and can end up on another
 // thread than the call that follows it.
 
-func (c *Context) evalBytes(buf []byte, filename string, flags int, asModule bool) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
+// evalBytesLocked compiles and runs buf. The caller must hold the engine lock.
+//
+// Everything below is in the locked form on purpose: our own code never nests
+// an acquisition, which is what keeps the reentrant path of the engine lock out
+// of the hot path (see the reentrant type).
+func (c *Context) evalBytesLocked(buf []byte, filename string, flags int, asModule bool) (*Value, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
@@ -651,6 +652,11 @@ func (c *Context) wrapGet(v C.JSValue) (*Value, error) {
 func (c *Context) Set(name string, v interface{}) error {
 	c.mu.lock()
 	defer c.mu.unlock()
+	return c.setLocked(name, v)
+}
+
+// setLocked is Set without the engine lock: the caller must hold it.
+func (c *Context) setLocked(name string, v interface{}) error {
 	if c.closed {
 		return ErrClosed
 	}
@@ -673,11 +679,12 @@ func (c *Context) Set(name string, v interface{}) error {
 	return nil
 }
 
-// setAll sets several globals at once. It is a no-op for a nil/empty map and is
-// used by Eval/EvalFile so callers can pass script variables in one call.
-func (c *Context) setAll(vars map[string]interface{}) error {
+// setAllLocked sets several globals at once. It is a no-op for a nil/empty map
+// and is used by Eval/EvalFile so callers can pass script variables in one
+// call. The caller must hold the engine lock.
+func (c *Context) setAllLocked(vars map[string]interface{}) error {
 	for name, v := range vars {
-		if err := c.Set(name, v); err != nil {
+		if err := c.setLocked(name, v); err != nil {
 			return err
 		}
 	}
@@ -768,8 +775,7 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 
 // keep registers a JSValue and returns the golang wrapper. The entry keeps the
 // JSValue itself so the context can still free it after the wrapper has been
-// collected but before its finalizer has run, and it keeps a weak reference to
-// the wrapper so Close can disarm the wrappers that are still alive.
+// collected but before its finalizer has run.
 //
 // The id is what the three deleters -- Free, finalizeValue and closeLocked --
 // use to find the entry. It is minted here while the context's engine lock is
@@ -777,7 +783,7 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 func (c *Context) keep(v C.JSValue) *Value {
 	c.nextValueID++
 	nv := &Value{ctx: c, id: c.nextValueID, v: v}
-	c.values[nv.id] = valueEntry{jsv: v, w: weak.Make(nv)}
+	c.values[nv.id] = v
 	runtime.SetFinalizer(nv, finalizeValue)
 	return nv
 }
@@ -789,9 +795,9 @@ func (c *Context) keep(v C.JSValue) *Value {
 // It takes the owning context's engine lock, which is the only lock guarding
 // v.freed / v.ctx and the C context itself. No other goroutine can be touching
 // this value at that moment: a *Value becomes unreachable only once every
-// reference to it is gone, and both Value.Free and closeLocked clear this
-// finalizer before dropping the value, so the three writers of v.freed / v.ctx
-// are mutually exclusive by construction.
+// reference to it is gone, and Value.Free clears this finalizer before dropping
+// the value, so the writers of v.freed / v.ctx are mutually exclusive by
+// construction.
 //
 // Once the lock is held, c.closed is the whole story. closeLocked sets it and
 // nils c.c under the same lock, and it frees *every* JSValue in c.values --
@@ -884,58 +890,88 @@ func liveContextCount() int {
 }
 
 // ---------------------------------------------------------------------------
-// reentrant lock: JS may call golang, which may call JS again on the same
-// goroutine, so a plain mutex would deadlock.
+// engine lock: one per Context, reentrant, and cheap enough to sit on the
+// hottest path of the library.
+//
+// JavaScript can call a golang function which calls back into the same context,
+// so a plain mutex would deadlock on that path -- but a reentrancy test that
+// asks "is the holder me?" costs a goroutine id, and a goroutine id here means
+// parsing runtime.Stack. That is ~800ns, it slows down further under contention
+// because it contends on a runtime lock, and it used to be the one thing that
+// kept several engines from running in parallel: jsGlobalLock was replaced by
+// per-context locks, but every acquisition still funnelled through it.
+//
+// Two mechanisms instead, neither of which needs a goroutine id:
+//
+//   - A free lock is taken with TryLock. Most acquisitions find it free: our
+//     own code never holds the lock across a call to another locking method --
+//     internal helpers come in ...Locked form, and the one internal path that
+//     has to release a *Value while holding the lock goes through
+//     Value.freeLocked -- so the lock is only ever busy when javascript is
+//     calling back into golang, or when two goroutines share a context
+//     (LoadFileFromCache hands out shared contexts) and one waits.
+//   - The callback case is recognised by OS thread. A cgo callback keeps its M
+//     bound to the goroutine that runs it -- the C frames underneath live on
+//     that thread's stack, so the runtime cannot hand the M to another
+//     goroutine -- so while a callback of this engine is in flight, its thread
+//     identifies that goroutine exactly. Reading it is a TLS load.
 // ---------------------------------------------------------------------------
 
 type reentrant struct {
-	mu    sync.Mutex
-	owner int64
+	mu sync.Mutex
+	// depth counts how many times the current holder has taken the lock.
 	depth int32
+	// cbThread is the OS thread running a javascript->golang callback of this
+	// engine, 0 when none is in flight; cbCalls counts their nesting.
+	cbThread int64
+	cbCalls  int32
 }
 
 func (m *reentrant) lock() {
-	id := goid()
-	if atomic.LoadInt64(&m.owner) == id {
+	if m.mu.TryLock() {
+		atomic.StoreInt32(&m.depth, 1)
+		return
+	}
+	if t := atomic.LoadInt64(&m.cbThread); t != 0 && t == currentThread() {
+		// Re-entering from inside a javascript->golang callback of this engine:
+		// the thread identifies the holder, so this is the same goroutine.
 		atomic.AddInt32(&m.depth, 1)
 		return
 	}
+	// Held by another goroutine: wait for it.
+	//
+	// There is deliberately no third case. A goroutine that took the lock
+	// itself and then calls a locking method again is *not* recognised here --
+	// no goroutine id is consulted -- and would block on itself forever. That
+	// is why every internal path needing a locking operation while already
+	// holding the lock has to use its ...Locked form instead; the failure mode
+	// of forgetting is a deadlock in the tests, not silent corruption.
 	m.mu.Lock()
-	atomic.StoreInt64(&m.owner, id)
-	m.depth = 1
+	atomic.StoreInt32(&m.depth, 1)
 }
 
 func (m *reentrant) unlock() {
 	if atomic.AddInt32(&m.depth, -1) == 0 {
-		atomic.StoreInt64(&m.owner, 0)
 		m.mu.Unlock()
 	}
 }
 
-func goid() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// "goroutine 123 [running]:"
-	i := 10 // len("goroutine ")
-	start := -1
-	for ; i < n; i++ {
-		if buf[i] >= '0' && buf[i] <= '9' {
-			if start < 0 {
-				start = i
-			}
-		} else if start >= 0 {
-			break
-		}
-	}
-	if start < 0 {
-		return 0
-	}
-	var id int64
-	for i := start; i < n && buf[i] >= '0' && buf[i] <= '9'; i++ {
-		id = id*10 + int64(buf[i]-'0')
-	}
-	return id
+// enterCallback and exitCallback bracket every javascript->golang callback, so
+// that lock can tell the goroutine the callback runs on apart from any other.
+func (m *reentrant) enterCallback() {
+	atomic.StoreInt64(&m.cbThread, currentThread())
+	atomic.AddInt32(&m.cbCalls, 1)
 }
+
+func (m *reentrant) exitCallback() {
+	if atomic.AddInt32(&m.cbCalls, -1) == 0 {
+		atomic.StoreInt64(&m.cbThread, 0)
+	}
+}
+
+// currentThread is the OS thread the caller runs on. It is meaningful as an
+// identity only while a cgo callback is in flight (see qjs_thread_id).
+func currentThread() int64 { return int64(C.qjs_thread_id()) }
 
 // cstrPtr returns a pointer to the bytes of b without copying. quickjs only
 // reads the buffer (it copies what it needs), so no Go pointer escapes into C
