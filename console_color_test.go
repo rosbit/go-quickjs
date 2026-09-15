@@ -44,23 +44,23 @@ func TestConsoleColor(t *testing.T) {
 		t.Errorf("undefined not gray: %q", got)
 	}
 
-	// objects and arrays render as json in blue
-	if got := f.formatArg(map[string]interface{}{"Name": "pp"}); got != cBlue+`{"Name":"pp"}`+cReset {
-		t.Errorf("object not blue json: %q", got)
+	// objects and arrays render as json in cyan
+	if got := f.formatArg(map[string]interface{}{"Name": "pp"}); got != cCyan+`{"Name":"pp"}`+cReset {
+		t.Errorf("object not cyan json: %q", got)
 	}
-	if got := f.formatArg([]interface{}{"a", 1}); got != cBlue+`["a",1]`+cReset {
-		t.Errorf("array not blue json: %q", got)
+	if got := f.formatArg([]interface{}{"a", 1}); got != cCyan+`["a",1]`+cReset {
+		t.Errorf("array not cyan json: %q", got)
 	}
-	if got := f.formatArg([]interface{}{}); got != cBlue+"[]"+cReset {
-		t.Errorf("empty array not blue: %q", got)
+	if got := f.formatArg([]interface{}{}); got != cCyan+"[]"+cReset {
+		t.Errorf("empty array not cyan: %q", got)
 	}
-	if got := f.formatArg(map[string]interface{}{}); got != cBlue+"{}"+cReset {
-		t.Errorf("empty object not blue: %q", got)
+	if got := f.formatArg(map[string]interface{}{}); got != cCyan+"{}"+cReset {
+		t.Errorf("empty object not cyan: %q", got)
 	}
 
-	// methodless structs are json blue; unexported fields are dropped
-	if got := f.formatArg(plainPoint{X: 1, y: "hidden"}); got != cBlue+`{"X":1}`+cReset {
-		t.Errorf("plain struct not blue json: %q", got)
+	// methodless structs are json cyan; unexported fields are dropped
+	if got := f.formatArg(plainPoint{X: 1, y: "hidden"}); got != cCyan+`{"X":1}`+cReset {
+		t.Errorf("plain struct not cyan json: %q", got)
 	}
 	// structs with methods keep the js-style renderer
 	if got := f.formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {

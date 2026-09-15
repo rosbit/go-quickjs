@@ -18,7 +18,7 @@ import (
 )
 
 // ANSI colors used by the console output: strings and booleans red, numbers
-// yellow, objects/arrays (rendered as JSON) blue, functions blue,
+// yellow, objects/arrays (rendered as JSON) cyan, functions cyan,
 // undefined/null gray.
 const (
 	cReset  = "\033[0m"
@@ -169,13 +169,13 @@ func (f logFmt) formatValue(a interface{}, depth int) string {
 		return f.formatJsValue(v, depth)
 	case map[string]interface{}:
 		if len(v) == 0 {
-			return f.colorize(cBlue, "{}")
+			return f.colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
 			return f.colorize(cGray, "{...}")
 		}
 		if b, err := json.Marshal(v); err == nil {
-			return f.colorize(cBlue, string(b))
+			return f.colorize(cCyan, string(b))
 		}
 		// not json-encodable: fall back to the js-style renderer
 		keys := make([]string, 0, len(v))
@@ -190,13 +190,13 @@ func (f logFmt) formatValue(a interface{}, depth int) string {
 		return "{" + strings.Join(parts, ", ") + "}"
 	case []interface{}:
 		if len(v) == 0 {
-			return f.colorize(cBlue, "[]")
+			return f.colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
 			return f.colorize(cGray, "[...]")
 		}
 		if b, err := json.Marshal(v); err == nil {
-			return f.colorize(cBlue, string(b))
+			return f.colorize(cCyan, string(b))
 		}
 		// not json-encodable: fall back to the js-style renderer
 		parts := make([]string, 0, len(v))
@@ -247,13 +247,13 @@ func (f logFmt) formatGoReflect(rv reflect.Value, depth int) string {
 			return f.colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return f.colorize(cBlue, "{}")
+			return f.colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
 			return f.colorize(cGray, "{...}")
 		}
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cBlue, string(b))
+			return f.colorize(cCyan, string(b))
 		}
 		// not json-encodable (cyclic, non-string keys, funcs...): js-style
 		keys := make([]string, 0, rv.Len())
@@ -275,13 +275,13 @@ func (f logFmt) formatGoReflect(rv reflect.Value, depth int) string {
 			return f.colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return f.colorize(cBlue, "[]")
+			return f.colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
 			return f.colorize(cGray, "[...]")
 		}
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cBlue, string(b))
+			return f.colorize(cCyan, string(b))
 		}
 		// not json-encodable: js-style
 		parts := make([]string, 0, rv.Len())
@@ -295,7 +295,7 @@ func (f logFmt) formatGoReflect(rv reflect.Value, depth int) string {
 		if rv.IsNil() {
 			return f.colorize(cGray, "null")
 		}
-		return f.colorize(cBlue, goReflectFuncName(rv))
+		return f.colorize(cCyan, goReflectFuncName(rv))
 	case reflect.String:
 		return f.colorize(cRed, rv.String())
 	case reflect.Bool:
@@ -318,7 +318,7 @@ func goReflectFuncName(rv reflect.Value) string {
 }
 
 // formatGoStruct renders a struct -- or a pointer to one. Without exported
-// methods it renders as json in blue; with methods the js-style renderer
+// methods it renders as json in cyan; with methods the js-style renderer
 // keeps {Field: v, Method: [Function: M]} so the methods stay visible.
 // Rendering through a pointer keeps pointer-receiver methods in the method
 // set.
@@ -328,7 +328,7 @@ func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
 	}
 	if rv.NumMethod() == 0 {
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cBlue, string(b))
+			return f.colorize(cCyan, string(b))
 		}
 	}
 	fields := rv
@@ -354,7 +354,7 @@ func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
 		parts = append(parts, m.Name+": [Function: "+m.Name+"]")
 	}
 	if len(parts) == 0 {
-		return f.colorize(cBlue, "{}")
+		return f.colorize(cCyan, "{}")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -385,7 +385,7 @@ func (f logFmt) formatJsValue(v *Value, depth int) string {
 			}
 			nv.Free()
 		}
-		return f.colorize(cBlue, goJsFuncName(name))
+		return f.colorize(cCyan, goJsFuncName(name))
 	case v.IsString():
 		return f.colorize(cRed, v.String())
 	case v.IsBool():
@@ -407,7 +407,7 @@ func (f logFmt) formatJsValue(v *Value, depth int) string {
 	// the output the user expects, matching the pre-upgrade console.
 	if v.isPlainJs() {
 		if s, err := v.JSON(); err == nil && s != "" {
-			return f.colorize(cBlue, s)
+			return f.colorize(cCyan, s)
 		}
 	}
 	// Exotic JS values (Date, RegExp, Map, Set, Error, typed arrays, circular):
@@ -417,7 +417,7 @@ func (f logFmt) formatJsValue(v *Value, depth int) string {
 	if s == "" {
 		return f.colorize(cGray, "undefined")
 	}
-	return f.colorize(cBlue, s)
+	return f.colorize(cCyan, s)
 }
 
 func goJsFuncName(name string) string {
