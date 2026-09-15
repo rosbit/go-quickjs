@@ -19,57 +19,62 @@ func TestConsoleColor(t *testing.T) {
 		t.Errorf("captured writer must stay plain: %q", sb.String())
 	}
 
-	logColorEnabled = true
-	defer func() { logColorEnabled = false }()
+	// the colour decision is per call now, so it is a value handed to the
+	// formatter instead of a package-level flag
+	f := logFmt{color: true}
+	defer func() {
+		if plain := (logFmt{}).formatArg("abc"); strings.Contains(plain, "\x1b[") {
+			t.Errorf("plain formatter must not emit escapes: %q", plain)
+		}
+	}()
 
-	if got := formatArg("abc"); !strings.Contains(got, cRed+"abc"+cReset) {
+	if got := f.formatArg("abc"); !strings.Contains(got, cRed+"abc"+cReset) {
 		t.Errorf("string not red: %q", got)
 	}
-	if got := formatArg(int64(42)); !strings.Contains(got, cYellow+"42"+cReset) {
+	if got := f.formatArg(int64(42)); !strings.Contains(got, cYellow+"42"+cReset) {
 		t.Errorf("number not yellow: %q", got)
 	}
-	if got := formatArg(3.5); !strings.Contains(got, cYellow+"3.5"+cReset) {
+	if got := f.formatArg(3.5); !strings.Contains(got, cYellow+"3.5"+cReset) {
 		t.Errorf("float not yellow: %q", got)
 	}
-	if got := formatArg(true); !strings.Contains(got, cRed+"true"+cReset) {
+	if got := f.formatArg(true); !strings.Contains(got, cRed+"true"+cReset) {
 		t.Errorf("bool not red: %q", got)
 	}
-	if got := formatArg(nil); !strings.Contains(got, cGray+"undefined"+cReset) {
+	if got := f.formatArg(nil); !strings.Contains(got, cGray+"undefined"+cReset) {
 		t.Errorf("undefined not gray: %q", got)
 	}
 
 	// objects and arrays render as json in blue
-	if got := formatArg(map[string]interface{}{"Name": "pp"}); got != cBlue+`{"Name":"pp"}`+cReset {
+	if got := f.formatArg(map[string]interface{}{"Name": "pp"}); got != cBlue+`{"Name":"pp"}`+cReset {
 		t.Errorf("object not blue json: %q", got)
 	}
-	if got := formatArg([]interface{}{"a", 1}); got != cBlue+`["a",1]`+cReset {
+	if got := f.formatArg([]interface{}{"a", 1}); got != cBlue+`["a",1]`+cReset {
 		t.Errorf("array not blue json: %q", got)
 	}
-	if got := formatArg([]interface{}{}); got != cBlue+"[]"+cReset {
+	if got := f.formatArg([]interface{}{}); got != cBlue+"[]"+cReset {
 		t.Errorf("empty array not blue: %q", got)
 	}
-	if got := formatArg(map[string]interface{}{}); got != cBlue+"{}"+cReset {
+	if got := f.formatArg(map[string]interface{}{}); got != cBlue+"{}"+cReset {
 		t.Errorf("empty object not blue: %q", got)
 	}
 
 	// methodless structs are json blue; unexported fields are dropped
-	if got := formatArg(plainPoint{X: 1, y: "hidden"}); got != cBlue+`{"X":1}`+cReset {
+	if got := f.formatArg(plainPoint{X: 1, y: "hidden"}); got != cBlue+`{"X":1}`+cReset {
 		t.Errorf("plain struct not blue json: %q", got)
 	}
 	// structs with methods keep the js-style renderer
-	if got := formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {
+	if got := f.formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {
 		t.Errorf("method not rendered: %q", got)
 	}
 
 	// cyclic maps cannot be json-encoded: js-style fallback, no hang
 	cyc := map[string]interface{}{}
 	cyc["self"] = cyc
-	if got := formatArg(cyc); !strings.Contains(got, "self:") {
+	if got := f.formatArg(cyc); !strings.Contains(got, "self:") {
 		t.Errorf("cyclic map fallback missing: %q", got)
 	}
 
-	// rendering must restore plain mode afterwards
-	logColorEnabled = false
+	// a coloured render must not leak into a later plain write
 	var sb2 strings.Builder
 	writeLine(&sb2, "back")
 	if strings.Contains(sb2.String(), "\x1b[") {
@@ -91,7 +96,7 @@ func TestConsoleLogJsPrettyPrint(t *testing.T) {
 		code string
 		want string
 	}{
-		{`console.log(new Date(0))`, "1970"},                       // Date -> ISO
+		{`console.log(new Date(0))`, "1970"},                     // Date -> ISO
 		{`console.log(new Map([[1, 2]]))`, "Map(1)"},             // Map
 		{`console.log(new Set([1]))`, "Set(1)"},                  // Set
 		{`console.log(/re/g)`, "/re/g"},                          // RegExp

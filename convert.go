@@ -288,7 +288,7 @@ func jsToGo(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, error) 
 
 	switch t.Kind() {
 	case reflect.Bool:
-		return reflect.ValueOf(C.JS_ToBool(c.c, jsVal) != 0).Convert(t), nil
+		return reflect.ValueOf(C.qjs_to_bool(c.c, jsVal) != 0).Convert(t), nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		i := c.toInt64(jsVal)
 		v := reflect.New(t).Elem()
@@ -301,7 +301,7 @@ func jsToGo(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, error) 
 		return v, nil
 	case reflect.Float32, reflect.Float64:
 		var f C.double
-		C.JS_ToFloat64(c.c, &f, jsVal)
+		C.qjs_to_float64(c.c, &f, jsVal)
 		v := reflect.New(t).Elem()
 		v.SetFloat(float64(f))
 		return v, nil

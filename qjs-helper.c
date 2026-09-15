@@ -84,13 +84,15 @@ JSValue qjs_throw_error(JSContext *ctx, const char *msg) {
 
 /* consumes val (quickjs takes ownership, even on failure) */
 int qjs_set_prop(JSContext *ctx, JSValueConst obj, const char *key, JSValue val) {
+    qjs_stack_guard(ctx); /* a setter could run here */
     return JS_SetPropertyStr(ctx, obj, key, val);
 }
 
 /* consumes val; the property is enumerable/writable/configurable */
 int qjs_define_prop(JSContext *ctx, JSValueConst obj, const char *key, JSValue val) {
-    int ret = JS_DefinePropertyValueStr(ctx, obj, key, val,
-                                        JS_PROP_C_W_E);
+    int ret;
+    qjs_stack_guard(ctx);
+    ret = JS_DefinePropertyValueStr(ctx, obj, key, val, JS_PROP_C_W_E);
     return ret;
 }
 
@@ -143,6 +145,7 @@ void qjs_set_module_loader(JSRuntime *rt) {
 /* compile + run a module: compiles, sets import.meta, then evaluates */
 JSValue qjs_eval_module(JSContext *ctx, const char *buf, size_t len,
                         const char *filename) {
+    qjs_stack_guard(ctx);
     JSValue val = JS_Eval(ctx, buf, len, filename,
                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(val)) {
@@ -186,6 +189,7 @@ int qjs_print_value(JSContext *ctx, JSValueConst val, char **out, size_t *out_le
 {
     qjs_print_buf p = {0};
     JSPrintValueOptions opts;
+    qjs_stack_guard(ctx); /* walking properties can trigger a getter */
     JS_PrintValueSetDefaultOptions(&opts);
     opts.max_depth = 8;          /* match console.go maxLogDepth */
     opts.max_string_length = 0;  /* no truncation */

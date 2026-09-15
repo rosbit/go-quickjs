@@ -33,6 +33,42 @@ extern const char *qjs_message_str;
 extern const char *qjs_name_str;
 extern const char *qjs_stack_str;
 
+/* ---- C stack guard bookkeeping ---- */
+
+/*
+ * quickjs bounds the C stack by comparing the current frame address against a
+ * limit derived from a stack top it recorded earlier -- at runtime creation, or
+ * at the last explicit refresh. That assumes the C stack never moves, which
+ * holds for a plain C host and fails here: cgo runs each call on whichever OS
+ * thread the goroutine happens to be on, and go is free to migrate the
+ * goroutine between two cgo calls (any gc or preemption point in between is
+ * enough). A goroutine that created its runtime on one thread and then runs
+ * javascript on another is measured against a stack top belonging to the first
+ * thread, and every frame address on the second thread may look like it is
+ * below the limit -- quickjs then reports a bogus "stack overflow" for code
+ * that is perfectly fine.
+ *
+ * Refreshing the top at the entry of each call that can run javascript makes
+ * the guard measure what it is meant to measure: the stack *this* call
+ * consumes. A single cgo call never migrates threads, so the refresh lands on
+ * the same stack the parser and interpreter are about to descend from. Doing
+ * it here in C rather than in golang is what closes the window: a refresh made
+ * from golang is a separate cgo call, and the goroutine can move threads before
+ * the call that actually runs javascript.
+ *
+ * The guard therefore bounds each entry, not the whole js -> go -> js chain: a
+ * nested call made from a golang callback re-anchors the limit lower down. That
+ * is the same behaviour the old golang-side refresh had, and it only matters
+ * for recursion that alternates across the boundary, which pure javascript
+ * recursion -- what the guard is really for -- never does.
+ */
+static inline void qjs_stack_guard(JSContext *ctx) {
+	JS_UpdateStackTop(JS_GetRuntime(ctx));
+}
+static inline void qjs_stack_guard_rt(JSRuntime *rt) {
+	JS_UpdateStackTop(rt);
+}
+
 /* ---- constant values ---- */
 static inline JSValue qjs_undefined(void) { return JS_UNDEFINED; }
 static inline JSValue qjs_null(void)      { return JS_NULL; }
@@ -47,10 +83,36 @@ static inline int qjs_is_bool(JSValueConst v)      { return JS_IsBool(v); }
 static inline int qjs_is_number(JSValueConst v)    { return JS_IsNumber(v); }
 static inline int qjs_is_string(JSValueConst v)    { return JS_IsString(v); }
 static inline int qjs_is_object(JSValueConst v)    { return JS_IsObject(v); }
-static inline int qjs_is_array(JSContext *ctx, JSValueConst v)    { return JS_IsArray(ctx, v); }
+static inline int qjs_is_array(JSContext *ctx, JSValueConst v) {
+	qjs_stack_guard(ctx);
+	return JS_IsArray(ctx, v);
+}
 static inline int qjs_is_function(JSContext *ctx, JSValueConst v) { return JS_IsFunction(ctx, v); }
 static inline int qjs_is_error(JSContext *ctx, JSValueConst v)    { return JS_IsError(ctx, v); }
 static inline int qjs_tag(JSValueConst v)          { return JS_VALUE_GET_TAG(v); }
+
+/* ---- conversions (may run javascript: valueOf / toString / proxy traps) ---- */
+static inline int qjs_to_bool(JSContext *ctx, JSValueConst v) {
+	qjs_stack_guard(ctx);
+	return JS_ToBool(ctx, v);
+}
+static inline int qjs_to_int64(JSContext *ctx, int64_t *pres, JSValueConst v) {
+	qjs_stack_guard(ctx);
+	return JS_ToInt64(ctx, pres, v);
+}
+static inline int qjs_to_float64(JSContext *ctx, double *pres, JSValueConst v) {
+	qjs_stack_guard(ctx);
+	return JS_ToFloat64(ctx, pres, v);
+}
+static inline const char *qjs_to_cstring_len(JSContext *ctx, size_t *plen, JSValueConst v) {
+	qjs_stack_guard(ctx);
+	return JS_ToCStringLen(ctx, plen, v);
+}
+static inline int qjs_get_own_property_names(JSContext *ctx, JSPropertyEnum **ptab,
+                                             uint32_t *plen, JSValueConst obj, int flags) {
+	qjs_stack_guard(ctx);
+	return JS_GetOwnPropertyNames(ctx, ptab, plen, obj, flags);
+}
 
 /* ---- value constructors ---- */
 static inline JSValue qjs_new_object(JSContext *ctx)  { return JS_NewObject(ctx); }
@@ -67,13 +129,16 @@ static inline JSValue qjs_new_string(JSContext *ctx, const char *s, size_t len) 
 /* ---- object / property / call ---- */
 static inline JSValue qjs_global(JSContext *ctx) { return JS_GetGlobalObject(ctx); }
 static inline JSValue qjs_get_prop(JSContext *ctx, JSValueConst obj, const char *name) {
+	qjs_stack_guard(ctx);
 	return JS_GetPropertyStr(ctx, obj, name);
 }
 static inline JSValue qjs_get_prop_u32(JSContext *ctx, JSValueConst obj, uint32_t idx) {
+	qjs_stack_guard(ctx);
 	return JS_GetPropertyUint32(ctx, obj, idx);
 }
 static inline JSValue qjs_call(JSContext *ctx, JSValueConst fn, JSValueConst thisVal,
                                int argc, JSValue *argv) {
+	qjs_stack_guard(ctx);
 	return JS_Call(ctx, fn, thisVal, argc, argv);
 }
 static inline JSValue qjs_dup_value(JSContext *ctx, JSValueConst v) { return JS_DupValue(ctx, v); }
@@ -82,6 +147,7 @@ static inline void qjs_free_value(JSContext *ctx, JSValue v) { JS_FreeValue(ctx,
 /* ---- eval ---- */
 static inline JSValue qjs_eval(JSContext *ctx, const char *buf, size_t len,
                                const char *filename, int flags) {
+	qjs_stack_guard(ctx);
 	return JS_Eval(ctx, buf, len, filename, flags);
 }
 
@@ -90,6 +156,7 @@ static inline JSValue qjs_get_exception(JSContext *ctx) { return JS_GetException
 
 /* ---- json ---- */
 static inline JSValue qjs_json_stringify(JSContext *ctx, JSValueConst v) {
+	qjs_stack_guard(ctx);
 	return JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
 }
 
@@ -104,7 +171,7 @@ static inline int qjs_is_promise(JSContext *ctx, JSValueConst v) {
 	if (!JS_IsObject(v)) {
 		return 0;
 	}
-	then = JS_GetPropertyStr(ctx, v, "then");
+	then = qjs_get_prop(ctx, v, "then"); /* a getter could run here */
 	r = JS_IsFunction(ctx, then);
 	JS_FreeValue(ctx, then);
 	return r;
@@ -116,6 +183,7 @@ static inline int qjs_promise_state(JSContext *ctx, JSValueConst v) {
 	return (int)JS_PromiseState(ctx, v);
 }
 static inline int qjs_execute_pending_job(JSRuntime *rt, JSContext **pctx) {
+	qjs_stack_guard_rt(rt);
 	return JS_ExecutePendingJob(rt, pctx);
 }
 

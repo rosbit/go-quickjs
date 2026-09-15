@@ -10,13 +10,13 @@ import (
 	"math"
 	"runtime"
 	"unsafe"
-	"weak"
 )
 
 // Value is a javascript value owned by golang. It stays valid until Free is
 // called or until its Context is closed.
 type Value struct {
 	ctx   *Context
+	id    uint64 // key of this value's entry in ctx.values, stable for its lifetime
 	v     C.JSValue
 	freed bool
 }
@@ -24,19 +24,28 @@ type Value struct {
 // Free releases the underlying JSValue. Calling Free twice is harmless, and so
 // is freeing a value whose context has already been closed.
 func (v *Value) Free() {
-	if v == nil || v.freed || v.ctx == nil {
+	if v == nil {
 		return
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	ctx := v.ctx
-	if v.freed {
+	// ctx is only ever nil'd under the engine lock of the context it points at,
+	// and a *Value never changes owner, so reading it once up front is enough to
+	// find the lock to take.
+	c := v.ctx
+	if c == nil {
+		return
+	}
+	c.mu.lock()
+	defer c.mu.unlock()
+	if v.freed || v.ctx == nil {
 		return
 	}
 	v.freed = true
-	if !ctx.closed {
-		C.JS_FreeValue(ctx.c, v.v)
-		delete(ctx.values, weak.Make(v))
+	// A closed context has already freed every JSValue it was holding -- even
+	// ones whose wrapper was still queued for finalization -- so there is nothing
+	// left to release here.
+	if !c.closed {
+		C.JS_FreeValue(c.c, v.v)
+		delete(c.values, v.id)
 	}
 	v.ctx = nil
 	runtime.SetFinalizer(v, nil)
@@ -52,11 +61,13 @@ func (v *Value) Context() *Context {
 
 // Freed reports whether the value has been released.
 func (v *Value) Freed() bool {
-	if v == nil {
+	// A nil context means the value was already freed: there is no engine lock
+	// left to take, so report it as released without touching anything.
+	if v == nil || v.ctx == nil {
 		return true
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	return v.freed || v.ctx.closed
 }
 
@@ -112,8 +123,8 @@ func (v *Value) test(f func() bool) bool {
 	if v.check() != nil {
 		return false
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if v.freed || v.ctx.closed {
 		return false
 	}
@@ -125,8 +136,8 @@ func (v *Value) Bool() bool {
 	if v.check() != nil {
 		return false
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	return C.JS_ToBool(v.ctx.c, v.v) != 0
 }
 
@@ -135,10 +146,10 @@ func (v *Value) Int64() int64 {
 	if v.check() != nil {
 		return 0
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	var i C.int64_t
-	C.JS_ToInt64(v.ctx.c, &i, v.v)
+	C.qjs_to_int64(v.ctx.c, &i, v.v)
 	return int64(i)
 }
 
@@ -147,10 +158,10 @@ func (v *Value) Float64() float64 {
 	if v.check() != nil {
 		return 0
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	var f C.double
-	C.JS_ToFloat64(v.ctx.c, &f, v.v)
+	C.qjs_to_float64(v.ctx.c, &f, v.v)
 	return float64(f)
 }
 
@@ -160,8 +171,8 @@ func (v *Value) String() string {
 	if v.check() != nil {
 		return "<freed>"
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if C.qjs_is_string(v.v) != 0 {
 		return cGoString(v.ctx.c, v.v)
 	}
@@ -179,8 +190,8 @@ func (v *Value) Interface() (interface{}, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if v.freed || v.ctx.closed {
 		return nil, ErrFreed
 	}
@@ -192,8 +203,8 @@ func (v *Value) JSON() (string, error) {
 	if err := v.check(); err != nil {
 		return "", err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	return jsonStringify(v.ctx, v.v)
 }
 
@@ -207,8 +218,8 @@ func (v *Value) Pretty() string {
 	if v.check() != nil {
 		return "undefined"
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	var cstr *C.char
 	var clen C.size_t
 	C.qjs_print_value(v.ctx.c, v.v, &cstr, &clen)
@@ -244,8 +255,8 @@ func (v *Value) isPlainJs() bool {
 	if v.check() != nil {
 		return false
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if v.freed || v.ctx.closed {
 		return false
 	}
@@ -261,8 +272,8 @@ func (v *Value) Get(key string) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	ckey := C.CString(key)
 	prop := C.qjs_get_prop(v.ctx.c, v.v, ckey)
 	C.free(unsafe.Pointer(ckey))
@@ -274,8 +285,8 @@ func (v *Value) Set(key string, val interface{}) error {
 	if err := v.check(); err != nil {
 		return err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	jv, err := toJsValue(v.ctx, val)
 	if err != nil {
 		return err
@@ -294,8 +305,8 @@ func (v *Value) Call(args ...interface{}) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
 		return nil, errNotFunc
 	}
@@ -307,8 +318,8 @@ func (v *Value) CallMethod(name string, args ...interface{}) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	cname := C.CString(name)
 	fn := C.qjs_get_prop(v.ctx.c, v.v, cname)
 	C.free(unsafe.Pointer(cname))
@@ -329,8 +340,8 @@ func (v *Value) Keys() ([]string, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	return propertyNames(v.ctx, v.v)
 }
 
@@ -339,8 +350,8 @@ func (v *Value) Length() int {
 	if err := v.check(); err != nil {
 		return 0
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if C.qjs_is_array(v.ctx.c, v.v) == 0 {
 		return 0
 	}
@@ -354,8 +365,8 @@ func (v *Value) Elem(i int) (*Value, error) {
 	if err := v.check(); err != nil {
 		return nil, err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	e := C.qjs_get_prop_u32(v.ctx.c, v.v, C.uint32_t(i))
 	return v.ctx.wrapGet(e)
 }
@@ -375,12 +386,12 @@ func fromJsValue(c *Context, v C.JSValue) (interface{}, error) {
 	case C.qjs_is_number(v) != 0:
 		if C.qjs_tag(v) == C.JS_TAG_INT {
 			var i C.int64_t
-			if C.JS_ToInt64(c.c, &i, v) == 0 {
+			if C.qjs_to_int64(c.c, &i, v) == 0 {
 				return int64(i), nil
 			}
 		}
 		var f C.double
-		if C.JS_ToFloat64(c.c, &f, v) != 0 {
+		if C.qjs_to_float64(c.c, &f, v) != 0 {
 			return nil, c.takeError()
 		}
 		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
@@ -487,13 +498,13 @@ func propertyNames(c *Context, v C.JSValue) ([]string, error) {
 
 func (c *Context) toInt64(v C.JSValue) int64 {
 	var i C.int64_t
-	C.JS_ToInt64(c.c, &i, v)
+	C.qjs_to_int64(c.c, &i, v)
 	return int64(i)
 }
 
 func cGoString(c *C.JSContext, v C.JSValue) string {
 	var l C.size_t
-	s := C.JS_ToCStringLen(c, &l, v)
+	s := C.qjs_to_cstring_len(c, &l, v)
 	if s == nil {
 		return ""
 	}

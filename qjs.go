@@ -73,6 +73,9 @@ type ModuleLoader func(name string) ([]byte, error)
 // and freeing one never touches another. This independence is what lets us avoid
 // the random free-time crashes of earlier versions. jsRuntime is unexported:
 // from the caller's point of view a Context is the whole engine.
+//
+// It has no lock of its own. Because the objects are 1:1, the owning Context's
+// engine lock (Context.mu) covers every field here as well.
 type jsRuntime struct {
 	rt          *C.JSRuntime
 	funcs       *funcStore
@@ -82,7 +85,6 @@ type jsRuntime struct {
 	stdout      io.Writer
 	stderr      io.Writer
 	closed      bool
-	id          uint64 // stable identity for the liveRuntimes address-reuse guard
 }
 
 // Context wraps a quickjs JSContext and is the only handle callers see. It owns
@@ -90,18 +92,60 @@ type jsRuntime struct {
 // finalizer on the *Context reclaims the engine when it becomes unreachable;
 // Close cancels that finalizer so explicit release is immediate and the
 // finalizer only ever fires as a safety net.
+//
+// mu is the engine lock of this context: it serialises every quickjs C call
+// made on it, plus the golang state that belongs to it (closed, values, the
+// jsRuntime fields, the module directories while a module loads). It is
+// reentrant, because javascript can call a golang function which calls back
+// into the same context -- a plain mutex would deadlock on that path.
+//
+// Two different Contexts never share mu, so two goroutines driving two contexts
+// run javascript genuinely in parallel. That is sound for quickjs: a JSRuntime
+// only ever touches its own object heap, and the library's only process-wide
+// mutable state -- the class id allocator and the Atomics waiter list -- is
+// protected by quickjs' own pthread mutexes. The one thing quickjs forbids is
+// two goroutines using the *same* runtime at the same time, which is exactly
+// what mu prevents.
 type Context struct {
-	rt     *jsRuntime
-	c      *C.JSContext
-	values map[weak.Pointer[Value]]struct{} // weak refs so the context never pins its *Value objects, which would deadlock the finalizers of the c<->v cycle
-	closed bool
-	id     uint64 // stable identity for the liveContexts address-reuse guard
+	rt *jsRuntime
+	mu reentrant
+	c  *C.JSContext
 
-	// module resolution state, only touched while an Eval/Call holds the lock
+	// values records every JSValue this context still owes a free for.
+	//
+	// The key is an id minted here, not a weak pointer: a weak pointer is not a
+	// usable map key for this job. The collector clears an object's weak handle as
+	// soon as it is found unreachable -- which is *before* its finalizer runs --
+	// and a weak.Pointer made afterwards for that same object is a *different*
+	// handle. So a finalizer could never delete its own entry, and closeLocked
+	// would free a JSValue its finalizer had already freed. A plain id is stable
+	// for the whole life of the value, so every deleter removes exactly the entry
+	// it owns.
+	//
+	// Holding the JSValue here (rather than only in the wrapper) is what lets
+	// closeLocked release values whose wrapper is already gone, and holding it via
+	// a weak reference to the wrapper is what lets it disarm the wrappers that are
+	// still alive. The wrapper reference must be weak: a strong one would let the
+	// context pin its own *Value objects, and since a *Value points back at its
+	// context, that cycle would be uncollectable.
+	values      map[uint64]valueEntry
+	nextValueID uint64
+
+	closed bool
+
+	// module resolution state, only touched while an Eval/Call holds mu
 	mainDir string // directory of the file given to EvalFile/RunFile
 	modDir  string // directory of the module loaded most recently
 
 	convDepth int // nesting of the value being converted to js, see maxConvDepth
+}
+
+// valueEntry is one outstanding JSValue: the C value to free, plus a weak
+// reference to its golang wrapper (nil once the collector has reclaimed the
+// wrapper, which is exactly the case closeLocked still has to free for).
+type valueEntry struct {
+	jsv C.JSValue
+	w   weak.Pointer[Value]
 }
 
 type options struct {
@@ -177,10 +221,10 @@ func NewContext(opts ...Option) (*Context, error) {
 // returns the Context. The jsRuntime itself is unexported because it is a 1:1
 // implementation detail of the Context that callers never need to name.
 //
-// Allocation and registration happen under runtimeLifeMu, so that a runtime
-// address is always claimed in the liveRuntimes table before any finalizer can
-// inspect it. installBuiltins runs after the lock is released because it
-// executes javascript and must not block other create/free operations.
+// Nothing here takes a global lock. Creating an engine is thread-safe: quickjs
+// builds every runtime on its own heap, and the only shared resource touched --
+// the class id minted by registerGoObjectClass -- is handed out under quickjs'
+// own js_class_id_mutex, so two concurrent calls are idempotent.
 func newRuntime(opts ...Option) (*Context, error) {
 	o := &options{
 		stdout: os.Stdout,
@@ -191,15 +235,6 @@ func newRuntime(opts ...Option) (*Context, error) {
 			f(o)
 		}
 	}
-
-	// Allocation and registration run under the global lock first, then the life
-	// lock. This keeps a single, consistent lock order across creation and
-	// teardown -- jsGlobalLock -> runtimeLifeMu -- so a finalizer
-	// freeing a runtime can never deadlock against a concurrent allocation.
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	runtimeLifeMu.Lock()
-	defer runtimeLifeMu.Unlock()
 
 	rt := C.JS_NewRuntime()
 	if rt == nil {
@@ -225,7 +260,6 @@ func newRuntime(opts ...Option) (*Context, error) {
 		require:     o.require,
 		stdout:      o.stdout,
 		stderr:      o.stderr,
-		id:          atomic.AddUint64(&runtimeIDSeq, 1),
 	}
 
 	c := C.JS_NewContext(rt)
@@ -236,27 +270,20 @@ func newRuntime(opts ...Option) (*Context, error) {
 	ctx := &Context{
 		rt:     r,
 		c:      c,
-		values: make(map[weak.Pointer[Value]]struct{}),
-		id:     atomic.AddUint64(&runtimeIDSeq, 1),
+		values: make(map[uint64]valueEntry),
 	}
 	registerContext(ctx)
-	liveContexts[uintptr(unsafe.Pointer(c))] = ctx.id
+	liveEngines.Add(1)
 
-	// claim the address: the finalizer re-checks this before freeing, so a late
-	// finaliser can never release a live, address-reused runtime. We store only
-	// the stable id, never the Go pointer, so the registry does not keep the
-	// runtime alive and the *Context finalizer can actually fire.
-	liveRuntimes[uintptr(unsafe.Pointer(rt))] = r.id
-
-	// installBuiltins executes javascript; it re-acquires jsGlobalLock
-	// reentrantly and does not touch the liveRuntimes/liveContexts maps.
+	// installBuiltins executes javascript on the brand new context; it takes
+	// ctx.mu itself, like every other entry point.
 	installBuiltins(ctx)
 
 	// The *Context carries the only finalizer of the whole design: it reclaims
 	// the engine (context then runtime, in that order) when the caller forgot to
-	// Close. Storing ids -- not pointers -- in the live tables above means the
-	// context is truly unreachable once the caller drops it, so this safety net
-	// really runs instead of leaking forever.
+	// Close. The registry above holds only a weak pointer, so the context is
+	// truly unreachable once the caller drops it and this safety net really runs
+	// instead of leaking forever.
 	runtime.SetFinalizer(ctx, finalizeContext)
 	return ctx, nil
 }
@@ -268,23 +295,23 @@ func ReadFile(name string) ([]byte, error) {
 
 // finalizeContext is the finalizer installed on the *Context. It runs only when
 // the context (and therefore its runtime) is no longer reachable, i.e. when the
-// user forgot to Close. It is fully serialized by runtimeLifeMu against every
-// other allocation and deallocation, so a freed runtime address can never be
-// reused by a live one.
+// user forgot to Close.
+//
+// Nothing else can be inside the context at that point -- any goroutine holding
+// or using it would make it reachable -- so taking mu here is uncontended. It is
+// taken anyway so teardown has a single, uniform lock discipline.
 func finalizeContext(c *Context) {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	runtimeLifeMu.Lock()
-	defer runtimeLifeMu.Unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	teardown(c.rt, c)
 }
 
-// teardown frees the single context and then the runtime. The caller must hold
-// both jsGlobalLock and runtimeLifeMu (in that order), so the liveRuntimes
-// table and every quickjs C call are serialised against all other operations.
-// No per-runtime mutex is needed: jsGlobalLock already serialises every reader
-// and writer of r.closed / r.rt / r.funcs, because every path that touches them
-// runs inside it. It is safe to call more than once.
+// teardown frees the single context and then the runtime, in that order. The
+// caller must hold c.mu (Close and finalizeContext both do), which is enough:
+// c.closed / r.closed are the only guard needed, and mu serialises every reader
+// and writer of them. A freed engine address can therefore never be released
+// twice, and no global registry has to arbitrate. It is safe to call more than
+// once.
 func teardown(r *jsRuntime, c *Context) {
 	if r.closed {
 		return
@@ -306,16 +333,7 @@ func teardown(r *jsRuntime, c *Context) {
 		r.funcs.clear()
 	}
 	if r.rt != nil {
-		addr := uintptr(unsafe.Pointer(r.rt))
-		// Only free if we still own this address. A JS_NewRuntime may have reused
-		// it for a different, live runtime after this finaliser was scheduled; in
-		// that case freeing here would corrupt that live runtime. The check is
-		// safe because liveRuntimes is guarded by runtimeLifeMu, which this
-		// function's caller holds.
-		if liveRuntimes[addr] == r.id {
-			delete(liveRuntimes, addr)
-			C.JS_FreeRuntime(r.rt)
-		}
+		C.JS_FreeRuntime(r.rt)
 		r.closed = true
 		r.rt = nil
 	}
@@ -324,8 +342,8 @@ func teardown(r *jsRuntime, c *Context) {
 // GC forces a quickjs garbage collection on this context's runtime. It is safe to
 // call at any time; a closed context is a no-op.
 func (c *Context) GC() {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed || c.rt.closed {
 		return
 	}
@@ -341,50 +359,54 @@ func (c *Context) Close() error {
 	if c == nil {
 		return nil
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	runtimeLifeMu.Lock()
-	defer runtimeLifeMu.Unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	teardown(c.rt, c)
 	runtime.SetFinalizer(c, nil)
 	return nil
 }
 
 // closeLocked frees the values of the context and the JSContext itself. The
-// caller must hold jsGlobalLock and runtimeLifeMu (in that order); those two are
-// enough to keep a JS_NewContext from reusing this address while we free it, so
-// no context-level mutex is taken here. It is safe to call more than once.
+// caller must hold c.mu; the c.closed flag, set here under that same lock, is
+// what keeps JS_FreeContext from ever running twice -- no address registry needs
+// to arbitrate. It is safe to call more than once.
 func (c *Context) closeLocked() {
 	if c.closed {
 		return
 	}
-	// free the values first: they must not outlive their context. The map holds
-	// weak references to the *Value objects, so a value may already have been
-	// reclaimed by the GC (its own finalizer freed the JSValue); we simply skip
-	// such nil entries.
-	for wp := range c.values {
-		v := wp.Value()
-		if v == nil {
-			continue
+	// free the values first: they must not outlive their context. The JSValue is
+	// read from the map entry, not from the golang wrapper, because the wrapper
+	// may already be unreachable and queued for finalization -- in which case the
+	// JSValue is still very much alive and still ours to free. Doing this through
+	// the wrapper would skip exactly those values and leak them into
+	// JS_FreeRuntime, which asserts that no object is left behind.
+	//
+	// Entries whose finalizer already ran are gone from the map: finalizeValue
+	// deletes by id, so it removes precisely its own entry and never leaves a
+	// stale JSValue behind for this loop to free twice.
+	for _, e := range c.values {
+		C.JS_FreeValue(c.c, e.jsv)
+		// When the wrapper is still reachable, disarm it so a later Free or
+		// finalizer run cannot free the same JSValue twice. When it is not, the
+		// pending finalizer sees c.closed and drops the value instead.
+		if v := e.w.Value(); v != nil {
+			v.freed = true
+			v.ctx = nil
+			runtime.SetFinalizer(v, nil)
 		}
-		C.JS_FreeValue(c.c, v.v)
-		v.freed = true
-		v.ctx = nil
-		runtime.SetFinalizer(v, nil)
 	}
-	c.values = make(map[weak.Pointer[Value]]struct{})
+	c.values = make(map[uint64]valueEntry)
 
-	caddr := uintptr(unsafe.Pointer(c.c))
-	// Only free if we still own this address. A JS_NewContext may have reused it
-	// for a different, live context after this finaliser was scheduled; the check
-	// is safe under runtimeLifeMu, which the caller holds.
-	if liveContexts[caddr] == c.id {
-		delete(liveContexts, caddr)
-		C.JS_FreeContext(c.c)
-	}
-	c.closed = true
+	// Unregister before the JSContext is freed, while the address is still
+	// unambiguously ours. Doing it afterwards would let a context created
+	// concurrently -- possibly handed the very same address by the allocator --
+	// register under this key first, and this Delete would then wipe the new
+	// context's entry, leaving its javascript unable to find it.
 	unregisterContext(c)
+	C.JS_FreeContext(c.c)
+	c.closed = true
 	c.c = nil
+	liveEngines.Add(-1)
 }
 
 // Closed reports whether the context has been closed. A nil context counts as
@@ -393,15 +415,15 @@ func (c *Context) Closed() bool {
 	if c == nil {
 		return true
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	return c.closed
 }
 
 // Global returns the global object of the context.
 func (c *Context) Global() *Value {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return nil
 	}
@@ -434,8 +456,8 @@ func (c *Context) EvalModule(code, filename string) (*Value, error) {
 // import/export) are detected automatically and evaluated as modules. The
 // optional vars are set as globals before the file runs.
 func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, error) {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -449,23 +471,18 @@ func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, er
 	return c.evalBytes(buf, path, EvalGlobal, asModule)
 }
 
-// updateStackTop tells quickjs where the stack is right now.
-//
-// Cgo runs on the system stack of whichever thread the goroutine happens to be
-// scheduled on, and that address differs from call to call. Quickjs recorded it
-// once, when the runtime was created, and compares every later stack pointer
-// against that stale address -- so as soon as the goroutine lands on another
-// thread the check reports "stack overflow" for code that is perfectly fine.
-func (c *Context) updateStackTop() {
-	if c != nil && c.rt != nil && c.rt.rt != nil {
-		C.JS_UpdateStackTop(c.rt.rt)
-	}
-}
+// Note on quickjs' C stack guard: it compares the current frame address against
+// a stack top recorded earlier, which only works while the C stack stays put.
+// Cgo breaks that assumption -- each call runs on whichever thread the
+// goroutine is on, and go may migrate it between calls -- so the refresh has to
+// happen *inside* the C entry point, on the very stack the javascript is about
+// to run on. It lives in qjs-helper.h (qjs_stack_guard) for that reason; a
+// refresh issued from golang is a separate cgo call and can end up on another
+// thread than the call that follows it.
 
 func (c *Context) evalBytes(buf []byte, filename string, flags int, asModule bool) (*Value, error) {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	c.updateStackTop()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return nil, ErrClosed
 	}
@@ -508,8 +525,8 @@ func (c *Context) Await(v *Value) (*Value, error) {
 	if v == nil || v.ctx == nil {
 		return nil, ErrFreed
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed || v.freed {
 		return nil, ErrClosed
 	}
@@ -538,8 +555,8 @@ func (c *Context) RunFile(path, entry string, args ...interface{}) (interface{},
 
 // RunPendingJobs executes the pending promise jobs until none is left.
 func (c *Context) RunPendingJobs() error {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return ErrClosed
 	}
@@ -548,15 +565,13 @@ func (c *Context) RunPendingJobs() error {
 }
 
 func (c *Context) runJobsLocked() (bool, error) {
-	// The caller holds jsGlobalLock, which is the only lock guarding c.rt.rt /
+	// The caller holds c.mu, which is the only lock guarding c.rt.rt /
 	// c.rt.closed, so no per-runtime mutex is needed here.
 	r := c.rt.rt
 	closed := c.rt.closed
 	if closed || r == nil {
 		return false, ErrClosed
 	}
-	c.updateStackTop()
-
 	for i := 0; i < 100000; i++ {
 		var pctx *C.JSContext
 		ret := C.qjs_execute_pending_job(r, &pctx)
@@ -580,7 +595,6 @@ func (c *Context) runJobsLocked() (bool, error) {
 // resolve a promise by running pending jobs. jsVal is consumed and replaced.
 func (c *Context) awaitLocked(jsVal C.JSValue, out *C.JSValue) error {
 	for i := 0; i < 100000; i++ {
-		c.updateStackTop()
 		state := C.qjs_promise_state(c.c, jsVal)
 		if state != 0 { // 0 == pending
 			res := C.qjs_promise_result(c.c, jsVal)
@@ -610,8 +624,8 @@ func (c *Context) awaitLocked(jsVal C.JSValue, out *C.JSValue) error {
 // Get returns a global variable as a Value. The caller owns the returned value
 // and should Free it (or let the context be closed).
 func (c *Context) Get(name string) (*Value, error) {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return nil, ErrClosed
 	}
@@ -635,8 +649,8 @@ func (c *Context) wrapGet(v C.JSValue) (*Value, error) {
 // Set makes a golang value (function, variable, struct, map, slice...) visible
 // in javascript under the given global name.
 func (c *Context) Set(name string, v interface{}) error {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return ErrClosed
 	}
@@ -685,8 +699,8 @@ func (c *Context) Call(name string, args ...interface{}) (interface{}, error) {
 // The name may be a path such as "JSON.stringify"; in that case the parent
 // object is used as `this`.
 func (c *Context) CallValue(name string, args ...interface{}) (*Value, error) {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return nil, ErrClosed
 	}
@@ -723,7 +737,7 @@ func freeAll(c *Context, vals []C.JSValue) {
 	}
 }
 
-// invoke a js function. The caller must hold jsGlobalLock and owns fn/thisVal.
+// invoke a js function. The caller must hold c.mu and owns fn/thisVal.
 func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{}) (*Value, error) {
 	n := len(args)
 	var jsArgs *C.JSValue
@@ -743,7 +757,6 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 			C.qjs_set_value(jsArgs, C.int(i), jv)
 		}
 	}
-	c.updateStackTop()
 	res := C.qjs_call(c.c, fn, thisVal, C.int(n), jsArgs)
 	C.qjs_free_values(c.c, jsArgs, C.int(n))
 	if C.JS_IsException(res) != 0 {
@@ -753,59 +766,65 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 	return c.keep(res), nil
 }
 
-// keep registers a JSValue and returns the golang wrapper.
+// keep registers a JSValue and returns the golang wrapper. The entry keeps the
+// JSValue itself so the context can still free it after the wrapper has been
+// collected but before its finalizer has run, and it keeps a weak reference to
+// the wrapper so Close can disarm the wrappers that are still alive.
+//
+// The id is what the three deleters -- Free, finalizeValue and closeLocked --
+// use to find the entry. It is minted here while the context's engine lock is
+// held, so allocation and registration are one atomic step.
 func (c *Context) keep(v C.JSValue) *Value {
-	nv := &Value{ctx: c, v: v}
-	c.values[weak.Make(nv)] = struct{}{}
+	c.nextValueID++
+	nv := &Value{ctx: c, id: c.nextValueID, v: v}
+	c.values[nv.id] = valueEntry{jsv: v, w: weak.Make(nv)}
 	runtime.SetFinalizer(nv, finalizeValue)
 	return nv
 }
 
 // finalizeValue is the finalizer installed on every *Value handed to golang. It
-// frees the underlying JSValue, but only while the owning runtime and context
-// are provably still alive -- otherwise it would write into C memory that a
-// live, address-reused runtime now owns.
+// frees the underlying JSValue when the *Value became unreachable before the
+// caller freed it explicitly.
 //
-// jsGlobalLock is held for the whole operation, which already excludes teardown
-// (finalizeContext / Close) and closeLocked -- the only places that free the
-// engine, free context values and set v.freed / v.ctx = nil. runtimeLifeMu is
-// taken as well because the liveRuntimes table it protects is what tells us the
-// address is still ours. JS_FreeValue on a Go-exported function never re-enters
-// golang (the Go callback fires on *call*, not on *free*), so holding the locks
-// cannot deadlock.
+// It takes the owning context's engine lock, which is the only lock guarding
+// v.freed / v.ctx and the C context itself. No other goroutine can be touching
+// this value at that moment: a *Value becomes unreachable only once every
+// reference to it is gone, and both Value.Free and closeLocked clear this
+// finalizer before dropping the value, so the three writers of v.freed / v.ctx
+// are mutually exclusive by construction.
 //
-// If the runtime address has already been reused by a different live runtime, or
-// the context was closed first, the value is simply dropped without touching any
-// C memory.
+// Once the lock is held, c.closed is the whole story. closeLocked sets it and
+// nils c.c under the same lock, and it frees *every* JSValue in c.values --
+// including those whose wrapper had already been collected -- so a value that
+// reaches this finalizer after its context was closed must not free anything:
+// its JSValue is already gone. A value can only still need freeing when it is
+// absent from neither path, i.e. when v.freed is false and the context is open,
+// which is exactly the branch below.
+//
+// JS_FreeValue on a Go-exported function never re-enters golang (the Go callback
+// fires on *call*, not on *free*), so holding the lock cannot deadlock.
 func finalizeValue(v *Value) {
-	if v == nil {
+	if v == nil || v.ctx == nil {
 		return
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
-	runtimeLifeMu.Lock()
+	c := v.ctx
+	c.mu.lock()
+	defer c.mu.unlock()
 
-	// All reads of v.freed / v.ctx happen under jsGlobalLock, never racing with
-	// closeLocked which writes them under the same lock.
-	if v.freed || v.ctx == nil {
-		runtimeLifeMu.Unlock()
-		return
-	}
-	rt := v.ctx.rt
-	if rt == nil || rt.rt == nil || liveRuntimes[uintptr(unsafe.Pointer(rt.rt))] != rt.id {
-		// Address reused by a different live runtime, or already gone: drop.
+	if v.freed || c.closed {
+		// Either this value was freed explicitly, or closeLocked already freed
+		// every value of the context (this one included) while it was pending.
 		v.freed = true
 		v.ctx = nil
-		runtimeLifeMu.Unlock()
 		return
 	}
-
-	c := v.ctx
+	// A deleted-by-id entry can never be recreated: ids are minted from a
+	// counter, so this removes exactly the entry keep installed for this value and
+	// leaves no stale JSValue behind.
 	C.JS_FreeValue(c.c, v.v)
 	v.freed = true
 	v.ctx = nil
-	delete(c.values, weak.Make(v))
-	runtimeLifeMu.Unlock()
+	delete(c.values, v.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,78 +832,55 @@ func finalizeValue(v *Value) {
 // ---------------------------------------------------------------------------
 
 var (
-	// runtimeIDSeq mints a stable identity for every jsRuntime/Context. The id is
-	// what the live tables store (never the Go pointer), so those tables no longer
-	// keep the engine alive and the *Context finalizer can actually run.
-	runtimeIDSeq uint64
-
-	// ctxRegistry is guarded by jsGlobalLock, not a mutex of its own: every
-	// access happens while jsGlobalLock is held (register/unregister during
-	// creation and teardown, lookup from C callbacks that run inside an
-	// eval/call). A separate lock would only ever be taken underneath it.
-	ctxRegistry = map[uintptr]weak.Pointer[Context]{}
-
-	// runtimeLifeMu serialises access to the liveRuntimes/liveContexts tables
-	// and the closed flags against every allocation and deallocation. It is
-	// always taken AFTER jsGlobalLock (the order jsGlobalLock -> runtimeLifeMu
-	// is fixed across the whole package) so that a finalizer freeing a runtime
-	// can never deadlock against a concurrent allocation or eval.
-	runtimeLifeMu sync.Mutex
-
-	// liveRuntimes maps a JSRuntime* (as uintptr) to the id of the jsRuntime that
-	// currently owns it. A runtime finalizer holds a raw C pointer that can be
-	// reused by a later JS_NewRuntime, so before freeing it re-checks it still
-	// owns the address. A late finaliser therefore never releases a live,
-	// address-reused runtime -- it becomes a no-op instead of a use-after-free.
-	// We store the id, not the *jsRuntime, so this table does not pin the engine.
-	liveRuntimes = map[uintptr]uint64{}
-
-	// liveContexts maps a JSContext* (as uintptr) to the id of the *Context that
-	// currently owns it, mirroring liveRuntimes for the context level. Used to
-	// assert that a JS_FreeContext only ever frees memory this context owns.
-	liveContexts = map[uintptr]uint64{}
-
-	// jsGlobalLock serialises every call into the quickjs C library -- evals,
-	// calls, gets/sets AND the finalizer-driven frees. QuickJS is not
-	// thread-safe: the finalizer goroutine runs JS_FreeRuntime/JS_FreeValue
-	// concurrently with user goroutines running JS_Eval/JS_Call on (possibly
-	// different) runtimes, and that concurrent C execution corrupts shared
-	// library state. A single global lock makes all quickjs calls behave as if
-	// they ran on one goroutine. It is reentrant so JS callbacks that re-enter
-	// the library (from the same goroutine) do not deadlock.
-	jsGlobalLock = &reentrant{}
+	// ctxRegistry maps a JSContext* (as uintptr) to the *Context owning it. The C
+	// callbacks -- the module loader, golang function calls, the GoObject proxy --
+	// only receive the raw JSContext*, so they need a way back to the golang
+	// handle.
+	//
+	// A sync.Map keeps that lookup free of lock contention on the hot path:
+	// registration happens once, when the context is created, while every
+	// property access and every golang call from javascript reads it. It also
+	// keeps the registry out of every lock-ordering discussion, since it never
+	// takes another lock while holding one.
+	//
+	// Only a weak pointer is stored, so the registry never keeps a context alive
+	// and the *Context finalizer can still run after a forgotten Close.
+	ctxRegistry sync.Map // uintptr -> weak.Pointer[Context]
+	// liveEngines counts the engines (contexts) that are currently alive. It
+	// exists so the finalizer test can observe that a leaked engine is really
+	// reclaimed; production code never reads it.
+	liveEngines atomic.Int64
 )
 
-// registerContext, unregisterContext and lookupContext all rely on jsGlobalLock
-// being held by the caller (see the ctxRegistry comment above), so they do not
-// take a lock themselves.
+// registerContext, unregisterContext and lookupContext are safe to call from any
+// goroutine at any time: ctxRegistry is a sync.Map and never takes a second lock.
 func registerContext(c *Context) {
-	ctxRegistry[c.ctxKey()] = weak.Make(c)
+	ctxRegistry.Store(c.ctxKey(), weak.Make(c))
 }
 
 func unregisterContext(c *Context) {
-	delete(ctxRegistry, c.ctxKey())
+	ctxRegistry.Delete(c.ctxKey())
 }
 
 func lookupContext(p *C.JSContext) *Context {
 	if p == nil {
 		return nil
 	}
-	return ctxRegistry[uintptr(unsafe.Pointer(p))].Value()
+	wp, ok := ctxRegistry.Load(uintptr(unsafe.Pointer(p)))
+	if !ok {
+		return nil
+	}
+	return wp.(weak.Pointer[Context]).Value()
 }
 
 func (c *Context) ctxKey() uintptr {
 	return uintptr(unsafe.Pointer(c.c))
 }
 
-// liveRuntimeCount reports how many runtimes are currently tracked. It exists
-// only so internal tests can observe finalizer behaviour; production code never
-// needs the count. It locks runtimeLifeMu because every real access to
-// liveRuntimes is serialised by that mutex.
-func liveRuntimeCount() int {
-	runtimeLifeMu.Lock()
-	defer runtimeLifeMu.Unlock()
-	return len(liveRuntimes)
+// liveContextCount reports how many engines are currently alive. It exists only
+// so internal tests can observe finalizer behaviour.
+func liveContextCount() int {
+	return int(liveEngines.Load())
 }
 
 // ---------------------------------------------------------------------------

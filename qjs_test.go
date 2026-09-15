@@ -387,7 +387,7 @@ func TestCreateCloseStress(t *testing.T) {
 
 // The real "contexts that are never closed must be reclaimed by the finalizer"
 // assertion lives in finalizer_internal_test.go (package quickjs), because it
-// needs to inspect the unexported liveRuntimes map. This file is package
+// needs to read the unexported live-engine counter. This file is package
 // quickjs_test and cannot. Kept here only as a no-crash smoke test.
 func TestFinalizerReclaimSmoke(t *testing.T) {
 	for i := 0; i < 50; i++ {
@@ -400,9 +400,10 @@ func TestFinalizerReclaimSmoke(t *testing.T) {
 		}
 		_ = ctx
 	}
-	// force the finalizers to run; teardown() is fully serialized by
-	// runtimeLifeMu, so a freed runtime address can never be reused by the next
-	// test's JS_NewRuntime.
+	// force the finalizers to run; teardown() holds the dying context's own
+	// engine lock and is guarded by its closed flag, so an engine is never
+	// released twice even when these finalizers overlap the next test's
+	// JS_NewRuntime.
 	for i := 0; i < 5; i++ {
 		runtime.GC()
 	}
@@ -472,11 +473,11 @@ func TestConcurrentContexts(t *testing.T) {
 	wg.Wait()
 }
 
-// A single Context shared by several goroutines must stay race-free: after
-// collapsing the redundant per-Context / per-runtime mutexes, the one global
-// lock is what serialises every entry point. Run under -race, this exercises
-// Eval, Closed and GC concurrently on the same context and checks the shared
-// javascript state stayed consistent.
+// A single Context shared by several goroutines must stay race-free. Now that
+// each Context carries its own reentrant engine lock (and different contexts
+// no longer share one), this lock is what serialises every entry point of this
+// context. Run under -race, this exercises Eval, Closed and GC concurrently on
+// the same context and checks the shared javascript state stayed consistent.
 func TestConcurrentSharedContext(t *testing.T) {
 	ctx, err := qjs.NewContext()
 	if err != nil {

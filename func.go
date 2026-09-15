@@ -249,8 +249,8 @@ func toJsResult(c *Context, v reflect.Value) C.JSValue {
 //	ctx.BindFunc("add", &add)
 //	fmt.Println(add(1, 2))
 func (c *Context) BindFunc(name string, fnVarPtr interface{}) error {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 	if c.closed {
 		return ErrClosed
 	}
@@ -289,8 +289,8 @@ func (v *Value) Bind(fnVarPtr interface{}) error {
 	if err := v.check(); err != nil {
 		return err
 	}
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	v.ctx.mu.lock()
+	defer v.ctx.mu.unlock()
 	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
 		return errNotFunc
 	}
@@ -322,8 +322,8 @@ func (c *Context) bindFuncValue(jsFn C.JSValue, fnVarPtr interface{}) error {
 }
 
 func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value) []reflect.Value {
-	jsGlobalLock.lock()
-	defer jsGlobalLock.unlock()
+	c.mu.lock()
+	defer c.mu.unlock()
 
 	zero := func() []reflect.Value {
 		res := make([]reflect.Value, ft.NumOut())
