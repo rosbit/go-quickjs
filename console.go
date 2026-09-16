@@ -30,35 +30,15 @@ const (
 	cGray   = "\033[90m"
 )
 
-// logFmt carries the per-call rendering state of one console write. The colour
-// decision used to live in a package-level variable, which was safe only for as
-// long as a single global engine lock serialised every console call. Contexts
-// now render in parallel, so the flag travels with the call instead: two
-// goroutines logging from two contexts can no longer observe each other's mode.
-type logFmt struct{ color bool }
-
 // colorize wraps s in an ANSI color escape; containers stay uncolored so the
 // nested leaf colors remain readable.
-func (f logFmt) colorize(color, s string) string {
-	if !f.color {
-		return s
-	}
+//
+// Coloring is unconditional. The writer is not inspected, so a redirected file
+// or a pipe receives exactly the escapes a terminal does, and nothing here
+// consults the environment. Callers that store console output as plain text
+// have to strip the escapes on their side.
+func colorize(color, s string) string {
 	return color + s + cReset
-}
-
-// isTerminalWriter reports whether w writes to a real terminal. Colors are
-// only emitted for terminals; redirected files, pipes and captured writers
-// keep clean plain text.
-func isTerminalWriter(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // installBuiltins adds a minimal console object and a print() function, both
@@ -141,10 +121,9 @@ func writeLine(w io.Writer, args ...interface{}) {
 		fmt.Fprintln(w)
 		return
 	}
-	f := logFmt{color: isTerminalWriter(w)}
 	parts := make([]string, 0, len(args))
 	for _, a := range args {
-		parts = append(parts, f.formatArg(a))
+		parts = append(parts, formatArg(a))
 	}
 	fmt.Fprintln(w, strings.Join(parts, " "))
 	releaseArgs(args)
@@ -157,25 +136,25 @@ const maxLogDepth = 8
 // expect to read it: objects as {k: v}, arrays as [v, ...], functions as
 // [Function: name]. Go values handed over as objects show their fields and
 // methods, so console.log is enough to inspect them.
-func (f logFmt) formatArg(a interface{}) string {
-	return f.formatValue(a, 0)
+func formatArg(a interface{}) string {
+	return formatValue(a, 0)
 }
 
-func (f logFmt) formatValue(a interface{}, depth int) string {
+func formatValue(a interface{}, depth int) string {
 	switch v := a.(type) {
 	case nil:
-		return f.colorize(cGray, "undefined")
+		return colorize(cGray, "undefined")
 	case *Value:
-		return f.formatJsValue(v, depth)
+		return formatJsValue(v, depth)
 	case map[string]interface{}:
 		if len(v) == 0 {
-			return f.colorize(cCyan, "{}")
+			return colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
-			return f.colorize(cGray, "{...}")
+			return colorize(cGray, "{...}")
 		}
 		if b, err := json.Marshal(v); err == nil {
-			return f.colorize(cCyan, string(b))
+			return colorize(cCyan, string(b))
 		}
 		// not json-encodable: fall back to the js-style renderer
 		keys := make([]string, 0, len(v))
@@ -185,41 +164,41 @@ func (f logFmt) formatValue(a interface{}, depth int) string {
 		sort.Strings(keys)
 		parts := make([]string, 0, len(keys))
 		for _, k := range keys {
-			parts = append(parts, k+": "+f.formatValue(v[k], depth+1))
+			parts = append(parts, k+": "+formatValue(v[k], depth+1))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	case []interface{}:
 		if len(v) == 0 {
-			return f.colorize(cCyan, "[]")
+			return colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
-			return f.colorize(cGray, "[...]")
+			return colorize(cGray, "[...]")
 		}
 		if b, err := json.Marshal(v); err == nil {
-			return f.colorize(cCyan, string(b))
+			return colorize(cCyan, string(b))
 		}
 		// not json-encodable: fall back to the js-style renderer
 		parts := make([]string, 0, len(v))
 		for _, e := range v {
-			parts = append(parts, f.formatValue(e, depth+1))
+			parts = append(parts, formatValue(e, depth+1))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case bool:
 		if v {
-			return f.colorize(cRed, "true")
+			return colorize(cRed, "true")
 		}
-		return f.colorize(cRed, "false")
+		return colorize(cRed, "false")
 	case float64:
 		if v == float64(int64(v)) {
-			return f.colorize(cYellow, fmt.Sprintf("%d", int64(v)))
+			return colorize(cYellow, fmt.Sprintf("%d", int64(v)))
 		}
-		return f.colorize(cYellow, fmt.Sprintf("%v", v))
+		return colorize(cYellow, fmt.Sprintf("%v", v))
 	case int64:
-		return f.colorize(cYellow, fmt.Sprintf("%d", v))
+		return colorize(cYellow, fmt.Sprintf("%d", v))
 	case string:
-		return f.colorize(cRed, v)
+		return colorize(cRed, v)
 	default:
-		return f.formatGoReflect(reflect.ValueOf(a), depth)
+		return formatGoReflect(reflect.ValueOf(a), depth)
 	}
 }
 
@@ -227,33 +206,33 @@ func (f logFmt) formatValue(a interface{}, depth int) string {
 // {k: v}, slices as [v, ...], structs by their exported fields, functions as
 // [Function: Name]. This is what makes a proxied golang value readable even
 // though the proxy itself has no enumerable js properties.
-func (f logFmt) formatGoReflect(rv reflect.Value, depth int) string {
+func formatGoReflect(rv reflect.Value, depth int) string {
 	if !rv.IsValid() {
-		return f.colorize(cGray, "undefined")
+		return colorize(cGray, "undefined")
 	}
 	switch rv.Kind() {
 	case reflect.Ptr, reflect.Interface:
 		if rv.IsNil() {
-			return f.colorize(cGray, "null")
+			return colorize(cGray, "null")
 		}
 		if rv.Kind() == reflect.Ptr && rv.Elem().Kind() == reflect.Struct {
 			// render through the pointer: its method set includes
 			// pointer-receiver methods
-			return f.formatGoStruct(rv, depth)
+			return formatGoStruct(rv, depth)
 		}
-		return f.formatGoReflect(rv.Elem(), depth)
+		return formatGoReflect(rv.Elem(), depth)
 	case reflect.Map:
 		if rv.IsNil() {
-			return f.colorize(cGray, "null")
+			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return f.colorize(cCyan, "{}")
+			return colorize(cCyan, "{}")
 		}
 		if depth >= maxLogDepth {
-			return f.colorize(cGray, "{...}")
+			return colorize(cGray, "{...}")
 		}
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cCyan, string(b))
+			return colorize(cCyan, string(b))
 		}
 		// not json-encodable (cyclic, non-string keys, funcs...): js-style
 		keys := make([]string, 0, rv.Len())
@@ -267,43 +246,43 @@ func (f logFmt) formatGoReflect(rv reflect.Value, depth int) string {
 		sort.Strings(keys)
 		parts := make([]string, 0, len(keys))
 		for _, k := range keys {
-			parts = append(parts, k+": "+f.formatGoReflect(values[k], depth+1))
+			parts = append(parts, k+": "+formatGoReflect(values[k], depth+1))
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && rv.IsNil() {
-			return f.colorize(cGray, "null")
+			return colorize(cGray, "null")
 		}
 		if rv.Len() == 0 {
-			return f.colorize(cCyan, "[]")
+			return colorize(cCyan, "[]")
 		}
 		if depth >= maxLogDepth {
-			return f.colorize(cGray, "[...]")
+			return colorize(cGray, "[...]")
 		}
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cCyan, string(b))
+			return colorize(cCyan, string(b))
 		}
 		// not json-encodable: js-style
 		parts := make([]string, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
-			parts = append(parts, f.formatGoReflect(rv.Index(i), depth+1))
+			parts = append(parts, formatGoReflect(rv.Index(i), depth+1))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case reflect.Struct:
-		return f.formatGoStruct(rv, depth)
+		return formatGoStruct(rv, depth)
 	case reflect.Func:
 		if rv.IsNil() {
-			return f.colorize(cGray, "null")
+			return colorize(cGray, "null")
 		}
-		return f.colorize(cCyan, goReflectFuncName(rv))
+		return colorize(cCyan, goReflectFuncName(rv))
 	case reflect.String:
-		return f.colorize(cRed, rv.String())
+		return colorize(cRed, rv.String())
 	case reflect.Bool:
-		return f.colorize(cRed, fmt.Sprintf("%v", rv.Bool()))
+		return colorize(cRed, fmt.Sprintf("%v", rv.Bool()))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 		reflect.Uintptr, reflect.Float32, reflect.Float64:
-		return f.colorize(cYellow, fmt.Sprintf("%v", rv.Interface()))
+		return colorize(cYellow, fmt.Sprintf("%v", rv.Interface()))
 	default:
 		return fmt.Sprintf("%v", rv.Interface())
 	}
@@ -322,13 +301,13 @@ func goReflectFuncName(rv reflect.Value) string {
 // keeps {Field: v, Method: [Function: M]} so the methods stay visible.
 // Rendering through a pointer keeps pointer-receiver methods in the method
 // set.
-func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
+func formatGoStruct(rv reflect.Value, depth int) string {
 	if depth >= maxLogDepth {
-		return f.colorize(cGray, "{...}")
+		return colorize(cGray, "{...}")
 	}
 	if rv.NumMethod() == 0 {
 		if b, err := json.Marshal(rv.Interface()); err == nil {
-			return f.colorize(cCyan, string(b))
+			return colorize(cCyan, string(b))
 		}
 	}
 	fields := rv
@@ -342,7 +321,7 @@ func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
 		if field.PkgPath != "" { // unexported
 			continue
 		}
-		parts = append(parts, field.Name+": "+f.formatGoReflect(fields.Field(i), depth+1))
+		parts = append(parts, field.Name+": "+formatGoReflect(fields.Field(i), depth+1))
 	}
 	for i := 0; i < rv.NumMethod(); i++ {
 		m := rv.Type().Method(i)
@@ -354,7 +333,7 @@ func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
 		parts = append(parts, m.Name+": [Function: "+m.Name+"]")
 	}
 	if len(parts) == 0 {
-		return f.colorize(cCyan, "{}")
+		return colorize(cCyan, "{}")
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
@@ -366,15 +345,15 @@ func (f logFmt) formatGoStruct(rv reflect.Value, depth int) string {
 // Map, Set, Error, typed arrays, circular refs, BigInt) fall through to
 // QuickJS' upstream pretty-printer (JS_PrintValue), the same one the qjs REPL
 // uses for console.log.
-func (f logFmt) formatJsValue(v *Value, depth int) string {
+func formatJsValue(v *Value, depth int) string {
 	if v == nil || v.Freed() {
-		return f.colorize(cGray, "undefined")
+		return colorize(cGray, "undefined")
 	}
 	switch {
 	case v.IsUndefined():
-		return f.colorize(cGray, "undefined")
+		return colorize(cGray, "undefined")
 	case v.IsNull():
-		return f.colorize(cGray, "null")
+		return colorize(cGray, "null")
 	case v.IsFunction():
 		name := ""
 		if nv, err := v.Get("name"); err == nil {
@@ -385,29 +364,29 @@ func (f logFmt) formatJsValue(v *Value, depth int) string {
 			}
 			nv.Free()
 		}
-		return f.colorize(cCyan, goJsFuncName(name))
+		return colorize(cCyan, goJsFuncName(name))
 	case v.IsString():
-		return f.colorize(cRed, v.String())
+		return colorize(cRed, v.String())
 	case v.IsBool():
-		return f.colorize(cRed, fmt.Sprintf("%v", v.Bool()))
+		return colorize(cRed, fmt.Sprintf("%v", v.Bool()))
 	case v.IsNumber():
 		num := v.Float64()
 		if num == float64(int64(num)) {
-			return f.colorize(cYellow, fmt.Sprintf("%d", int64(num)))
+			return colorize(cYellow, fmt.Sprintf("%d", int64(num)))
 		}
-		return f.colorize(cYellow, fmt.Sprintf("%v", num))
+		return colorize(cYellow, fmt.Sprintf("%v", num))
 	}
 	// Go proxies: keep the Go reflection renderer (fields + [Function: M]).
 	if v.isGoObject() {
 		if m, err := v.Interface(); err == nil {
-			return f.formatValue(m, depth+1)
+			return formatValue(m, depth+1)
 		}
 	}
 	// Plain JS objects and arrays: faithful JSON, e.g. {"Name":"pp"}. This keeps
 	// the output the user expects, matching the pre-upgrade console.
 	if v.isPlainJs() {
 		if s, err := v.JSON(); err == nil && s != "" {
-			return f.colorize(cCyan, s)
+			return colorize(cCyan, s)
 		}
 	}
 	// Exotic JS values (Date, RegExp, Map, Set, Error, typed arrays, circular):
@@ -415,9 +394,9 @@ func (f logFmt) formatJsValue(v *Value, depth int) string {
 	// REPL uses for console.log.
 	s := v.Pretty()
 	if s == "" {
-		return f.colorize(cGray, "undefined")
+		return colorize(cGray, "undefined")
 	}
-	return f.colorize(cCyan, s)
+	return colorize(cCyan, s)
 }
 
 func goJsFuncName(name string) string {

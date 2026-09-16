@@ -1,6 +1,7 @@
 package quickjs
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -10,76 +11,79 @@ type plainPoint struct {
 	y string // unexported: excluded from json
 }
 
-// colors must appear only in terminal mode; captured writers (builders,
-// files, pipes) keep clean plain text.
+// colors are emitted unconditionally -- the writer is not inspected -- so a
+// captured writer (builder, file, pipe) gets the same escapes a terminal does.
 func TestConsoleColor(t *testing.T) {
 	var sb strings.Builder
 	writeLine(&sb, "str", int64(42), true)
-	if strings.Contains(sb.String(), "\x1b[") {
-		t.Errorf("captured writer must stay plain: %q", sb.String())
+	out := sb.String()
+	for _, want := range []string{cRed + "str" + cReset, cYellow + "42" + cReset, cRed + "true" + cReset} {
+		if !strings.Contains(out, want) {
+			t.Errorf("captured writer lost the color %q: %q", want, out)
+		}
 	}
 
-	// the colour decision is per call now, so it is a value handed to the
-	// formatter instead of a package-level flag
-	f := logFmt{color: true}
-	defer func() {
-		if plain := (logFmt{}).formatArg("abc"); strings.Contains(plain, "\x1b[") {
-			t.Errorf("plain formatter must not emit escapes: %q", plain)
-		}
-	}()
-
-	if got := f.formatArg("abc"); !strings.Contains(got, cRed+"abc"+cReset) {
+	if got := formatArg("abc"); !strings.Contains(got, cRed+"abc"+cReset) {
 		t.Errorf("string not red: %q", got)
 	}
-	if got := f.formatArg(int64(42)); !strings.Contains(got, cYellow+"42"+cReset) {
+	if got := formatArg(int64(42)); !strings.Contains(got, cYellow+"42"+cReset) {
 		t.Errorf("number not yellow: %q", got)
 	}
-	if got := f.formatArg(3.5); !strings.Contains(got, cYellow+"3.5"+cReset) {
+	if got := formatArg(3.5); !strings.Contains(got, cYellow+"3.5"+cReset) {
 		t.Errorf("float not yellow: %q", got)
 	}
-	if got := f.formatArg(true); !strings.Contains(got, cRed+"true"+cReset) {
+	if got := formatArg(true); !strings.Contains(got, cRed+"true"+cReset) {
 		t.Errorf("bool not red: %q", got)
 	}
-	if got := f.formatArg(nil); !strings.Contains(got, cGray+"undefined"+cReset) {
+	if got := formatArg(nil); !strings.Contains(got, cGray+"undefined"+cReset) {
 		t.Errorf("undefined not gray: %q", got)
 	}
 
 	// objects and arrays render as json in cyan
-	if got := f.formatArg(map[string]interface{}{"Name": "pp"}); got != cCyan+`{"Name":"pp"}`+cReset {
+	if got := formatArg(map[string]interface{}{"Name": "pp"}); got != cCyan+`{"Name":"pp"}`+cReset {
 		t.Errorf("object not cyan json: %q", got)
 	}
-	if got := f.formatArg([]interface{}{"a", 1}); got != cCyan+`["a",1]`+cReset {
+	if got := formatArg([]interface{}{"a", 1}); got != cCyan+`["a",1]`+cReset {
 		t.Errorf("array not cyan json: %q", got)
 	}
-	if got := f.formatArg([]interface{}{}); got != cCyan+"[]"+cReset {
+	if got := formatArg([]interface{}{}); got != cCyan+"[]"+cReset {
 		t.Errorf("empty array not cyan: %q", got)
 	}
-	if got := f.formatArg(map[string]interface{}{}); got != cCyan+"{}"+cReset {
+	if got := formatArg(map[string]interface{}{}); got != cCyan+"{}"+cReset {
 		t.Errorf("empty object not cyan: %q", got)
 	}
 
 	// methodless structs are json cyan; unexported fields are dropped
-	if got := f.formatArg(plainPoint{X: 1, y: "hidden"}); got != cCyan+`{"X":1}`+cReset {
+	if got := formatArg(plainPoint{X: 1, y: "hidden"}); got != cCyan+`{"X":1}`+cReset {
 		t.Errorf("plain struct not cyan json: %q", got)
 	}
 	// structs with methods keep the js-style renderer
-	if got := f.formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {
+	if got := formatArg(&itItem{Name: "x"}); !strings.Contains(got, "[Function: Upper]") {
 		t.Errorf("method not rendered: %q", got)
 	}
 
 	// cyclic maps cannot be json-encoded: js-style fallback, no hang
 	cyc := map[string]interface{}{}
 	cyc["self"] = cyc
-	if got := f.formatArg(cyc); !strings.Contains(got, "self:") {
+	if got := formatArg(cyc); !strings.Contains(got, "self:") {
 		t.Errorf("cyclic map fallback missing: %q", got)
 	}
 
-	// a coloured render must not leak into a later plain write
+	// the next write is colored as well: nothing is sticky, the escapes are a
+	// property of the formatter rather than of the previous call
 	var sb2 strings.Builder
 	writeLine(&sb2, "back")
-	if strings.Contains(sb2.String(), "\x1b[") {
-		t.Errorf("color mode leaked after writeLine: %q", sb2.String())
+	if !strings.Contains(sb2.String(), cRed+"back"+cReset) {
+		t.Errorf("later write not colored: %q", sb2.String())
 	}
+}
+
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
+
+// stripANSI drops the escapes colorize adds, so a test can assert on the text a
+// user reads independently of how it happens to be colored.
+func stripANSI(s string) string {
+	return ansiEscape.ReplaceAllString(s, "")
 }
 
 // raw JS values that JSON.stringify cannot represent must be rendered by the

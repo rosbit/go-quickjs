@@ -121,9 +121,9 @@ func TestParallelEnginesDoNotCrosstalk(t *testing.T) {
 
 // Two engines logging at the same time must not see each other's output. The
 // console formatter used to decide colours through a package-level flag, which
-// was only safe while a global lock serialised every call; the flag is now
-// carried by the call. Run under -race this also guards against reintroducing
-// shared rendering state.
+// was only safe while a global lock serialised every call; the formatter is now
+// stateless, so engines share no rendering state at all. Run under -race this
+// also guards against reintroducing any.
 func TestParallelConsoleWritersStayIsolated(t *testing.T) {
 	const workers = 4
 	const lines = 60

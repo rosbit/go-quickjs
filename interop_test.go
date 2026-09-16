@@ -114,7 +114,9 @@ func TestConsoleLogRendersMethods(t *testing.T) {
 	if _, err := c.Eval(`console.log("p:", p)`, nil); err != nil {
 		t.Fatal(err)
 	}
-	out := sb.String()
+	// the field value is colorized, so assert on the text a user reads rather
+	// than on the escapes around it
+	out := stripANSI(sb.String())
 	if !strings.Contains(out, "Name: pp") {
 		t.Errorf("console.log lost the struct field: %q", out)
 	}
