@@ -112,6 +112,13 @@ type Context struct {
 	mu reentrant
 	c  *C.JSContext
 
+	// eng is the single OS thread this context's quickjs runtime lives on for
+	// its whole lifetime. Every C call -- including the JS_FreeValue a finalizer
+	// issues -- is dispatched to it through eng.submit, so quickjs' GC always
+	// scans one stable stack and the per-thread stack guard stays correct. See
+	// the engine type below.
+	eng *engine
+
 	// values records every JSValue this context still owes a free for.
 	//
 	// The key is an id minted here, not a weak pointer: a weak pointer is not a
@@ -159,6 +166,9 @@ type options struct {
 	require      bool
 	stdout       io.Writer
 	stderr       io.Writer
+	// threadPinning pins each engine-lock critical section to a single OS thread
+	// (see WithThreadPinning). It is set once at Context creation.
+	threadPinning bool
 }
 
 // Option customizes a Context (and its underlying runtime).
@@ -213,6 +223,18 @@ func WithConsoleWriter(stdout, stderr io.Writer) Option {
 	return func(o *options) { o.stdout, o.stderr = stdout, stderr }
 }
 
+// WithThreadPinning is retained for API compatibility. The library now binds
+// every Context to a dedicated engine goroutine pinned to one OS thread for the
+// context's whole lifetime, so concurrent goroutines are safe WITHOUT this
+// option (see the engine type). It therefore has no additional effect and is
+// safe to keep passing.
+//
+// (Historical note: this used to opt into per-operation runtime.LockOSThread
+// pinning. That fixed the C stack guard but left the golang finalizer running
+// JS_FreeValue on a foreign thread, which still crashed; the engine goroutine
+// model supersedes it and fixes both.)
+func WithThreadPinning() Option { return func(o *options) { o.threadPinning = true } }
+
 // New creates a jsRuntime together with its single Context and returns the
 // Context. It is the same object the underlying jsRuntime hosts (1:1).
 func NewContext(opts ...Option) (*Context, error) {
@@ -239,73 +261,99 @@ func newRuntime(opts ...Option) (*Context, error) {
 		}
 	}
 
-	rt := C.JS_NewRuntime()
-	if rt == nil {
-		return nil, errors.New("qjs: failed to create quickjs runtime")
-	}
-	C.qjs_set_module_loader(rt)
-	if C.registerGoObjectClass(rt) != 0 {
-		C.JS_FreeRuntime(rt)
-		return nil, errors.New("qjs: failed to register the golang object class")
-	}
-	// The GoFuncData class carries the golang registry id of every js function
-	// that stands for a golang func, and its finalizer is what releases that
-	// entry once javascript drops the function. A failed registration would go
-	// unnoticed -- the objects would still work, they would just never be
-	// freed -- so it is a hard error here, not an ignored return value.
-	if C.registerGoFuncClass(rt) != 0 {
-		C.JS_FreeRuntime(rt)
-		return nil, errors.New("qjs: failed to register the golang function class")
-	}
-	if o.memoryLimit > 0 {
-		C.JS_SetMemoryLimit(rt, C.size_t(o.memoryLimit))
-	}
-	if o.gcThreshold > 0 {
-		C.JS_SetGCThreshold(rt, C.size_t(o.gcThreshold))
-	}
-	if o.maxStackSize > 0 {
-		C.JS_SetMaxStackSize(rt, C.size_t(o.maxStackSize))
-	}
-
-	r := &jsRuntime{
-		rt:          rt,
-		funcs:       newFuncStore(),
-		loader:      o.loader,
-		modulePaths: o.modulePaths,
-		require:     o.require,
-		stdout:      o.stdout,
-		stderr:      o.stderr,
-	}
-
-	c := C.JS_NewContext(rt)
-	if c == nil {
-		C.JS_FreeRuntime(rt)
-		return nil, errors.New("qjs: failed to create quickjs context")
-	}
-	// Only now, so that a failure above leaves nothing behind to unregister.
-	// It has to be in place before installBuiltins below, which is the first
-	// thing that registers a golang function (console.log), and before any
-	// javascript can run, because the finalizer that releases an entry looks
-	// the store up by runtime.
-	registerFuncStore(rt, r.funcs)
-
 	ctx := &Context{
-		rt:     r,
-		c:      c,
 		values: make(map[uint64]C.JSValue),
+		eng: &engine{
+			tasks: make(chan func(), 64),
+			quit:  make(chan struct{}),
+			done:  make(chan struct{}),
+		},
 	}
-	registerContext(ctx)
-	liveEngines.Add(1)
 
-	// installBuiltins executes javascript on the brand new context; it takes
-	// ctx.mu itself, like every other entry point.
-	installBuiltins(ctx)
+	// The whole runtime -- its creation, every later C call, and every value
+	// free -- must live on one OS thread. Spin that thread up now; the engine
+	// goroutine pins itself before it starts draining, so from here on the thread
+	// is fixed for good. (WithThreadPinning is now subsumed by this: the engine
+	// thread is pinned for the context's whole life, not just per call.)
+	go ctx.eng.loop()
+
+	var initErr error
+	ctx.submit(func() {
+		rt := C.JS_NewRuntime()
+		if rt == nil {
+			initErr = errors.New("qjs: failed to create quickjs runtime")
+			return
+		}
+		C.qjs_set_module_loader(rt)
+		if C.registerGoObjectClass(rt) != 0 {
+			C.JS_FreeRuntime(rt)
+			initErr = errors.New("qjs: failed to register the golang object class")
+			return
+		}
+		// The GoFuncData class carries the golang registry id of every js
+		// function that stands for a golang func, and its finalizer is what
+		// releases that entry once javascript drops the function. A failed
+		// registration would go unnoticed -- the objects would still work, they
+		// would just never be freed -- so it is a hard error here, not an
+		// ignored return value.
+		if C.registerGoFuncClass(rt) != 0 {
+			C.JS_FreeRuntime(rt)
+			initErr = errors.New("qjs: failed to register the golang function class")
+			return
+		}
+		if o.memoryLimit > 0 {
+			C.JS_SetMemoryLimit(rt, C.size_t(o.memoryLimit))
+		}
+		if o.gcThreshold > 0 {
+			C.JS_SetGCThreshold(rt, C.size_t(o.gcThreshold))
+		}
+		if o.maxStackSize > 0 {
+			C.JS_SetMaxStackSize(rt, C.size_t(o.maxStackSize))
+		}
+
+		r := &jsRuntime{
+			rt:          rt,
+			funcs:       newFuncStore(),
+			loader:      o.loader,
+			modulePaths: o.modulePaths,
+			require:     o.require,
+			stdout:      o.stdout,
+			stderr:      o.stderr,
+		}
+
+		c := C.JS_NewContext(rt)
+		if c == nil {
+			C.JS_FreeRuntime(rt)
+			initErr = errors.New("qjs: failed to create quickjs context")
+			return
+		}
+		// Only now, so that a failure above leaves nothing behind to
+		// unregister. It has to be in place before installBuiltins below, which
+		// is the first thing that registers a golang function (console.log), and
+		// before any javascript can run, because the finalizer that releases an
+		// entry looks the store up by runtime.
+		registerFuncStore(rt, r.funcs)
+
+		ctx.rt = r
+		ctx.c = c
+		registerContext(ctx)
+		liveEngines.Add(1)
+
+		// installBuiltins executes javascript on the brand new context; it takes
+		// ctx.mu itself, like every other entry point.
+		installBuiltins(ctx)
+	})
+
+	if initErr != nil {
+		ctx.eng.shutdown()
+		return nil, initErr
+	}
 
 	// The *Context carries the only finalizer of the whole design: it reclaims
 	// the engine (context then runtime, in that order) when the caller forgot to
-	// Close. The registry above holds only a weak pointer, so the context is
-	// truly unreachable once the caller drops it and this safety net really runs
-	// instead of leaking forever.
+	// Close. The engine goroutine holds only the engine struct (never a strong
+	// reference to the context), so once the caller drops the context this
+	// safety net really runs and stops the goroutine instead of leaking it.
 	runtime.SetFinalizer(ctx, finalizeContext)
 	return ctx, nil
 }
@@ -323,9 +371,39 @@ func ReadFile(name string) ([]byte, error) {
 // or using it would make it reachable -- so taking mu here is uncontended. It is
 // taken anyway so teardown has a single, uniform lock discipline.
 func finalizeContext(c *Context) {
-	c.mu.lock()
-	defer c.mu.unlock()
-	teardown(c.rt, c)
+	if c == nil || c.eng == nil {
+		return
+	}
+	runtime.SetFinalizer(c, nil)
+	e := c.eng
+	// The finalizer must not block: Go runs finalizers on a small pool of
+	// goroutines, and waiting on the engine to fully stop (as Close does) would
+	// starve that pool and stall every other finalizer. So we hand the engine a
+	// single task that tears the context down and then stops the loop, and return
+	// immediately. The engine drains it at its own pace; by the time it runs,
+	// every value belonging to this context has already been enqueued (a Value's
+	// finalizer runs before the Context's because the Value keeps the Context
+	// alive) and is therefore freed ahead of the teardown in FIFO order.
+	//
+	// e.done is closed only after the loop has fully exited. If it is already
+	// closed the context was Closed explicitly, so there is nothing to do.
+	select {
+	case <-e.done:
+		return
+	default:
+	}
+	teardown := func() {
+		c.mu.lock()
+		teardown(c.rt, c)
+		c.mu.unlock()
+		e.stop()
+	}
+	select {
+	case e.tasks <- teardown:
+	case <-e.done:
+		// The loop is gone; Close already tore the context down (or is about
+		// to, on its own task). Never block a finalizer goroutine on this.
+	}
 }
 
 // teardown frees the single context and then the runtime, in that order. The
@@ -375,12 +453,17 @@ func teardown(r *jsRuntime, c *Context) {
 // GC forces a quickjs garbage collection on this context's runtime. It is safe to
 // call at any time; a closed context is a no-op.
 func (c *Context) GC() {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed || c.rt.closed {
+	if c == nil || c.eng == nil {
 		return
 	}
-	C.JS_RunGC(c.rt.rt)
+	c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed || c.rt.closed {
+			return
+		}
+		C.JS_RunGC(c.rt.rt)
+	})
 }
 
 // Close frees the context and the runtime it belongs to. Because a Context and
@@ -389,13 +472,42 @@ func (c *Context) GC() {
 // safety-net finalizer so the engine is released immediately, not whenever the
 // next GC happens to run.
 func (c *Context) Close() error {
-	if c == nil {
+	if c == nil || c.eng == nil {
 		return nil
 	}
-	c.mu.lock()
-	defer c.mu.unlock()
-	teardown(c.rt, c)
+	e := c.eng
+	// Tear down on the engine thread (so JS_FreeContext / JS_FreeRuntime run on
+	// the runtime's home thread), then stop the goroutine. Cancelling the
+	// finalizer first means finalizeContext can never race with this.
+	c.submit(func() {
+		c.mu.lock()
+		teardown(c.rt, c)
+		c.mu.unlock()
+	})
 	runtime.SetFinalizer(c, nil)
+	// shutdown waits for the loop to exit, which would deadlock if Close were
+	// called from inside a JS->Go callback -- there the engine thread is the
+	// caller itself and the loop cannot return until the callback does. stop()
+	// is enough in that case: the loop notices quit as soon as we unwind.
+	if e.threadID.Load() == currentThread() {
+		e.stop()
+	} else {
+		e.shutdown()
+	}
+	// teardown always runs on the first Close; if the engine had already been
+	// stopped it ran before. Seal the flag either way: a context that stayed
+	// open on paper while its JSContext is gone would let a still-referenced
+	// golang func keep calling into C with a nil JSContext.
+	c.mu.lock()
+	if !c.closed {
+		c.closed = true
+		c.c = nil
+	}
+	c.mu.unlock()
+	// c.eng is deliberately NOT nilled here. It is read without a lock all over
+	// the hot path (submit, callJsFunc, Freed), so clearing it would be a data
+	// race against every concurrent caller for no benefit: a stopped engine is
+	// detected through e.done, which is exactly what submit relies on.
 	return nil
 }
 
@@ -447,58 +559,106 @@ func (c *Context) Closed() bool {
 
 // Global returns the global object of the context.
 func (c *Context) Global() *Value {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed {
+	if c == nil || c.eng == nil {
 		return nil
 	}
-	g := C.qjs_global(c.c)
-	if C.JS_IsException(g) != 0 {
-		return nil
-	}
-	return c.keep(C.qjs_dup_value(c.c, g))
+	var ret *Value
+	c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			return
+		}
+		g := C.qjs_global(c.c)
+		if C.JS_IsException(g) != 0 {
+			return
+		}
+		ret = c.keep(C.qjs_dup_value(c.c, g))
+	})
+	return ret
 }
 
 // Eval compiles and runs javascript source code. The optional vars are set as
 // globals before the code runs, so scripts can read them without a separate
 // SetAll call.
 func (c *Context) Eval(code string, vars map[string]interface{}) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
-	// One critical section for the globals and the code: a shared context must
-	// not let another goroutine slip in between and run with these globals set.
-	if err := c.setAllLocked(vars); err != nil {
-		return nil, err
+	if c == nil || c.eng == nil {
+		return nil, ErrClosed
 	}
-	return c.evalBytesLocked([]byte(code), "<eval>", EvalGlobal, false)
+	var ret *Value
+	var err error
+	c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		// One critical section for the globals and the code: a shared context must
+		// not let another goroutine slip in between and run with these globals set.
+		if c.closed {
+			err = ErrClosed
+			return
+		}
+		if err = c.setAllLocked(vars); err != nil {
+			return
+		}
+		ret, err = c.evalBytesLocked([]byte(code), "<eval>", EvalGlobal, false)
+	})
+	return ret, err
 }
 
 // EvalModule compiles and runs source code as an ES module (import/export are
 // allowed). If the module uses top level await, pending jobs are executed until
 // the module is settled.
 func (c *Context) EvalModule(code, filename string) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
-	return c.evalBytesLocked([]byte(code), filename, EvalModule, true)
+	if c == nil || c.eng == nil {
+		return nil, ErrClosed
+	}
+	var ret *Value
+	var err error
+	if !c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			err = ErrClosed
+			return
+		}
+		ret, err = c.evalBytesLocked([]byte(code), filename, EvalModule, true)
+	}) {
+		return nil, ErrClosed
+	}
+	return ret, err
 }
 
 // EvalFile loads a javascript file and runs it. ES modules (files containing
 // import/export) are detected automatically and evaluated as modules. The
 // optional vars are set as globals before the file runs.
 func (c *Context) EvalFile(path string, vars map[string]interface{}) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
+	if c == nil || c.eng == nil {
+		return nil, ErrClosed
+	}
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.setAllLocked(vars); err != nil {
-		return nil, err
+	var ret *Value
+	var evalErr error
+	if !c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			evalErr = ErrClosed
+			return
+		}
+		if err = c.setAllLocked(vars); err != nil {
+			evalErr = err
+			return
+		}
+		// imports of this file resolve relative to its own directory first
+		c.mainDir, c.modDir = filepath.Dir(path), filepath.Dir(path)
+		asModule := C.qjs_is_module(cstrPtr(buf), C.size_t(len(buf))) != 0
+		ret, evalErr = c.evalBytesLocked(buf, path, EvalGlobal, asModule)
+	}) {
+		return nil, ErrClosed
 	}
-	// imports of this file resolve relative to its own directory first
-	c.mainDir, c.modDir = filepath.Dir(path), filepath.Dir(path)
-	asModule := C.qjs_is_module(cstrPtr(buf), C.size_t(len(buf))) != 0
-	return c.evalBytesLocked(buf, path, EvalGlobal, asModule)
+	return ret, evalErr
 }
 
 // Note on quickjs' C stack guard: it compares the current frame address against
@@ -558,23 +718,37 @@ func (c *Context) Await(v *Value) (*Value, error) {
 	if v == nil || v.ctx == nil {
 		return nil, ErrFreed
 	}
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed || v.freed {
+	if c == nil || c.eng == nil {
 		return nil, ErrClosed
 	}
-	if C.qjs_is_promise(c.c, v.v) == 0 {
-		return v, nil
+	var ret *Value
+	var err error
+	if !c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed || v.freed {
+			err = ErrClosed
+			return
+		}
+		if C.qjs_is_promise(c.c, v.v) == 0 {
+			ret = v
+			return
+		}
+		var out C.JSValue
+		if e := c.awaitLocked(C.qjs_dup_value(c.c, v.v), &out); e != nil {
+			err = e
+			return
+		}
+		if C.JS_IsException(out) != 0 {
+			C.JS_FreeValue(c.c, out)
+			err = c.takeError()
+			return
+		}
+		ret = c.keep(out)
+	}) {
+		return nil, ErrClosed
 	}
-	var out C.JSValue
-	if err := c.awaitLocked(C.qjs_dup_value(c.c, v.v), &out); err != nil {
-		return nil, err
-	}
-	if C.JS_IsException(out) != 0 {
-		C.JS_FreeValue(c.c, out)
-		return nil, c.takeError()
-	}
-	return c.keep(out), nil
+	return ret, err
 }
 
 // RunFile loads a javascript file and calls the named function with args,
@@ -588,12 +762,19 @@ func (c *Context) RunFile(path, entry string, args ...interface{}) (interface{},
 
 // RunPendingJobs executes the pending promise jobs until none is left.
 func (c *Context) RunPendingJobs() error {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed {
+	if c == nil || c.eng == nil {
 		return ErrClosed
 	}
-	_, err := c.runJobsLocked()
+	var err error
+	c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			err = ErrClosed
+			return
+		}
+		_, err = c.runJobsLocked()
+	})
 	return err
 }
 
@@ -657,17 +838,24 @@ func (c *Context) awaitLocked(jsVal C.JSValue, out *C.JSValue) error {
 // Get returns a global variable as a Value. The caller owns the returned value
 // and should Free it (or let the context be closed).
 func (c *Context) Get(name string) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed {
+	if c.eng == nil {
 		return nil, ErrClosed
 	}
-	g := C.qjs_global(c.c)
-	cname := C.CString(name)
-	v := C.qjs_get_prop(c.c, g, cname)
-	C.free(unsafe.Pointer(cname))
-	C.JS_FreeValue(c.c, g)
-	return c.wrapGet(v)
+	var ret *Value
+	var err error
+	c.submit(func() {
+		if c.closed {
+			err = ErrClosed
+			return
+		}
+		g := C.qjs_global(c.c)
+		cname := C.CString(name)
+		v := C.qjs_get_prop(c.c, g, cname)
+		C.free(unsafe.Pointer(cname))
+		C.JS_FreeValue(c.c, g)
+		ret, err = c.wrapGet(v)
+	})
+	return ret, err
 }
 
 // keep v; if v is an exception, the error is returned instead.
@@ -682,9 +870,16 @@ func (c *Context) wrapGet(v C.JSValue) (*Value, error) {
 // Set makes a golang value (function, variable, struct, map, slice...) visible
 // in javascript under the given global name.
 func (c *Context) Set(name string, v interface{}) error {
-	c.mu.lock()
-	defer c.mu.unlock()
-	return c.setLocked(name, v)
+	if c == nil || c.eng == nil {
+		return ErrClosed
+	}
+	var err error
+	c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		err = c.setLocked(name, v)
+	})
+	return err
 }
 
 // setLocked is Set without the engine lock: the caller must hold it.
@@ -738,36 +933,49 @@ func (c *Context) Call(name string, args ...interface{}) (interface{}, error) {
 // The name may be a path such as "JSON.stringify"; in that case the parent
 // object is used as `this`.
 func (c *Context) CallValue(name string, args ...interface{}) (*Value, error) {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed {
+	if c == nil || c.eng == nil {
 		return nil, ErrClosed
 	}
-	// walk the path, keeping every intermediate value alive until the call is
-	// done (the parent object is used as `this`)
-	path := []C.JSValue{C.qjs_global(c.c)}
-	cur := path[0]
-	for _, part := range strings.Split(name, ".") {
-		cpart := C.CString(part)
-		next := C.qjs_get_prop(c.c, cur, cpart)
-		C.free(unsafe.Pointer(cpart))
-		if C.JS_IsException(next) != 0 {
-			freeAll(c, path)
-			return nil, c.takeError()
+	var ret *Value
+	var err error
+	if !c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			err = ErrClosed
+			return
 		}
-		path = append(path, next)
-		cur = next
-	}
-	fn := path[len(path)-1]
-	thisVal := path[len(path)-2]
+		// walk the path, keeping every intermediate value alive until the call is
+		// done (the parent object is used as `this`)
+		path := []C.JSValue{C.qjs_global(c.c)}
+		cur := path[0]
+		for _, part := range strings.Split(name, ".") {
+			cpart := C.CString(part)
+			next := C.qjs_get_prop(c.c, cur, cpart)
+			C.free(unsafe.Pointer(cpart))
+			if C.JS_IsException(next) != 0 {
+				freeAll(c, path)
+				err = c.takeError()
+				return
+			}
+			path = append(path, next)
+			cur = next
+		}
+		fn := path[len(path)-1]
+		thisVal := path[len(path)-2]
 
-	if C.qjs_is_function(c.c, fn) == 0 {
+		if C.qjs_is_function(c.c, fn) == 0 {
+			freeAll(c, path)
+			err = fmt.Errorf("qjs: %q is not a function", name)
+			return
+		}
+		res, e := c.callLocked(fn, thisVal, args...)
 		freeAll(c, path)
-		return nil, fmt.Errorf("qjs: %q is not a function", name)
+		ret, err = res, e
+	}) {
+		return nil, ErrClosed
 	}
-	res, err := c.callLocked(fn, thisVal, args...)
-	freeAll(c, path)
-	return res, err
+	return ret, err
 }
 
 func freeAll(c *Context, vals []C.JSValue) {
@@ -814,7 +1022,7 @@ func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{
 // held, so allocation and registration are one atomic step.
 func (c *Context) keep(v C.JSValue) *Value {
 	c.nextValueID++
-	nv := &Value{ctx: c, id: c.nextValueID, v: v}
+	nv := &Value{ctx: c, id: c.nextValueID, v: v, eng: c.eng}
 	c.values[nv.id] = v
 	runtime.SetFinalizer(nv, finalizeValue)
 	return nv
@@ -842,27 +1050,52 @@ func (c *Context) keep(v C.JSValue) *Value {
 // JS_FreeValue on a Go-exported function never re-enters golang (the Go callback
 // fires on *call*, not on *free*), so holding the lock cannot deadlock.
 func finalizeValue(v *Value) {
-	if v == nil || v.ctx == nil {
+	if v == nil || v.eng == nil {
 		return
 	}
-	c := v.ctx
-	c.mu.lock()
-	defer c.mu.unlock()
+	runtime.SetFinalizer(v, nil)
+	e := v.eng
+	// Like finalizeContext, this finalizer must not block the finalizer pool.
+	// The free is dispatched to the engine thread and we return at once. The send
+	// is a plain buffered channel op (the engine always drains), so it completes
+	// without waiting for the task to run and without waiting on e.done.
+	//
+	// If the engine has already stopped (e.done closed) the context was Closed
+	// and Close already freed every value, so there is nothing to do.
+	select {
+	case <-e.done:
+		return
+	default:
+	}
+	e.tasks <- func() {
+		// The finalizer always runs on its own goroutine/thread, never the engine
+		// thread. Freeing a JSValue there would let quickjs' GC scan the wrong C
+		// stack and mis-collect live objects, which is exactly the crash this
+		// actor model exists to prevent -- so the free happens here, on the
+		// engine thread.
+		c := v.ctx
+		if c == nil {
+			return
+		}
+		c.mu.lock()
+		defer c.mu.unlock()
 
-	if v.freed || c.closed {
-		// Either this value was freed explicitly, or closeLocked already freed
-		// every value of the context (this one included) while it was pending.
+		if v.freed || c.closed {
+			// Either this value was freed explicitly, or closeLocked already
+			// freed every value of the context (this one included) while it was
+			// pending.
+			v.freed = true
+			v.ctx = nil
+			return
+		}
+		// A deleted-by-id entry can never be recreated: ids are minted from a
+		// counter, so this removes exactly the entry keep installed for this
+		// value and leaves no stale JSValue behind.
+		C.JS_FreeValue(c.c, v.v)
 		v.freed = true
 		v.ctx = nil
-		return
+		delete(c.values, v.id)
 	}
-	// A deleted-by-id entry can never be recreated: ids are minted from a
-	// counter, so this removes exactly the entry keep installed for this value and
-	// leaves no stale JSValue behind.
-	C.JS_FreeValue(c.c, v.v)
-	v.freed = true
-	v.ctx = nil
-	delete(c.values, v.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1238,10 @@ type reentrant struct {
 	// engine, 0 when none is in flight; cbCalls counts their nesting.
 	cbThread int64
 	cbCalls  int32
+	// threadPinning pins the OS thread for the duration of every critical
+	// section (see WithThreadPinning). It is set once at Context creation and
+	// read on the hot path without a lock.
+	threadPinning bool
 }
 
 func (m *reentrant) lock() {
@@ -1014,7 +1251,8 @@ func (m *reentrant) lock() {
 	}
 	if t := atomic.LoadInt64(&m.cbThread); t != 0 && t == currentThread() {
 		// Re-entering from inside a javascript->golang callback of this engine:
-		// the thread identifies the holder, so this is the same goroutine.
+		// the thread identifies the holder, so this is the same goroutine. The
+		// thread is already pinned by the outer acquisition, so nothing to do.
 		atomic.AddInt32(&m.depth, 1)
 		return
 	}
@@ -1061,4 +1299,137 @@ func cstrPtr(b []byte) *C.char {
 		return nil
 	}
 	return (*C.char)(unsafe.Pointer(unsafe.SliceData(b)))
+}
+
+// ---------------------------------------------------------------------------
+// engine: the single OS thread a Context's quickjs runtime lives on
+//
+// QuickJS runtimes are strictly single-threaded. Two facts make that painful in
+// Go: the garbage collector scans the C stack of whichever OS thread triggered
+// it to find live objects, and the C stack guard anchors the stack top to the
+// thread. So every operation on a runtime -- including the JS_FreeValue a golang
+// finalizer issues when a *Value is collected -- must run on the *same* OS
+// thread, for the whole lifetime of the runtime. A goroutine is not enough: Go is
+// free to migrate a goroutine to another thread between two cgo calls, and the
+// finalizer always runs on its own goroutine/thread.
+//
+// The engine solves this: every Context owns one goroutine that is pinned to a
+// single OS thread for its whole life (runtime.LockOSThread in loop). All C work
+// is dispatched to it through submit(); submit runs the closure directly when the
+// caller is already on the engine thread (a javascript->golang callback, or a
+// re-entrant submit) and otherwise queues it and waits. Because the engine
+// goroutine drains its queue one task at a time, every operation is also
+// serialised with respect to every other -- which is exactly the guarantee c.mu
+// used to provide, now enforced by a single thread instead of a mutex. The
+// reentrant lock still exists, but only as a re-entrancy counter for the JS->Go
+// callback path; only the engine thread ever takes it.
+// ---------------------------------------------------------------------------
+
+type engine struct {
+	tasks    chan func() // work queued by external goroutines
+	quit     chan struct{}
+	done     chan struct{}
+	threadID atomic.Int64 // OS thread id of the engine loop; 0 until started
+	stopOnce sync.Once    // guards the single close of quit
+}
+
+// stop requests the loop to exit once it has drained its queue. It is safe to
+// call from the engine thread (the finalizer task) or from Close; the Once
+// guard makes a double stop a no-op rather than a panic on close(quit).
+func (e *engine) stop() {
+	e.stopOnce.Do(func() { close(e.quit) })
+}
+
+// loop is the engine goroutine. It pins itself to one OS thread and then runs
+// every task the context submits, in order, for the context's whole life.
+func (e *engine) loop() {
+	runtime.LockOSThread()
+	e.threadID.Store(currentThread())
+	defer e.threadID.Store(0)
+	defer close(e.done)
+	for {
+		select {
+		case f := <-e.tasks:
+			f()
+		case <-e.quit:
+			// Drain anything still queued before exiting so a teardown task
+			// that stops the loop never leaves earlier value-free tasks behind.
+			for {
+				select {
+				case f := <-e.tasks:
+					f()
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// enqueue runs f on the engine thread, blocking until it has run, and reports
+// whether it ran. The caller must NOT already be on the engine thread (see
+// Context.submit / Value.submit, which decide whether to run inline).
+func (e *engine) enqueue(f func()) bool {
+	done := make(chan struct{})
+	task := func() { defer close(done); f() }
+	// If the loop has already returned there is no reader for e.tasks, so the
+	// task would sit in the buffer forever and the caller would block on done
+	// for the rest of the process' life. Check before queueing as well as
+	// after: a plain select between the send and <-e.quit would pick at random
+	// when both are ready and hang half the time.
+	select {
+	case <-e.done:
+		return false
+	default:
+	}
+	select {
+	case e.tasks <- task:
+		// The loop drains e.tasks before it exits, but it can still have exited
+		// in the window above. e.done -- closed by the loop's last defer --
+		// is the only reliable "it ran / it never will".
+		select {
+		case <-done:
+			return true
+		case <-e.done:
+			return false
+		}
+	case <-e.done:
+		return false
+	}
+}
+
+// shutdown stops the engine goroutine. It must only be called from Close, after
+// the teardown task has run (every value freed, the runtime released), and only
+// from Close -- never while a value might still submit work. finalizeContext
+// stops the loop from inside its own task instead, so it never has to block on
+// <-e.done and starve the finalizer pool.
+func (e *engine) shutdown() {
+	e.stop()
+	<-e.done
+}
+
+// submit runs f on the engine thread. If the caller is already on the engine
+// thread -- including inside a JS->Go callback, whose goroutine runs on that
+// thread even though it is a different goroutine than the engine loop -- f runs
+// inline so we never block on our own engine goroutine (which would deadlock):
+// the engine goroutine is busy running the enclosing task. Otherwise f is queued
+// and the caller blocks until it has run. The JS->Go callback case is detected
+// via c.mu.cbThread, which enterCallback stamps with the callback's OS thread id.
+// submit runs f on the engine thread and reports whether it actually ran.
+//
+// It reports false in the two cases where f is skipped: the context has no
+// engine left (it was Closed) or the engine stopped before picking the task up.
+// Both mean the context is closed, and a caller must then substitute its
+// "closed" result: a task that never ran leaves the output variables at their
+// zero values, which for an error return is indistinguishable from success.
+func (c *Context) submit(f func()) bool {
+	if c == nil || c.eng == nil {
+		return false
+	}
+	id := c.eng.threadID.Load()
+	if id != 0 && (currentThread() == id || currentThread() == atomic.LoadInt64(&c.mu.cbThread)) {
+		f()
+		return true
+	}
+	return c.eng.enqueue(f)
 }

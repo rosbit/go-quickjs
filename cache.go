@@ -43,7 +43,13 @@ func InitCache() {
 // require() 在这个入口里默认打开（等价于内部加了 WithRequire()），缓存的
 // Context 可以直接用 CommonJS 模块。
 //
-// 返回的 Context 是共享的：多个 goroutine 可以并发调用，内部串行化。
+// 返回的 Context 是共享的：命中缓存时多个 goroutine 会拿到同一个实例。但
+// QuickJS 的 runtime 是严格单线程的——默认情况下这个共享 Context 只能由"同一
+// 时刻一个 goroutine"驱动（内部已串行化，但 Go 可能在两次 cgo 调用之间把
+// goroutine 迁移到别的 OS 线程，从而破坏 C 栈守卫并导致 qjs_call 内 SIGSEGV）。
+// 若要让同一个缓存 Context 被多个 goroutine 真正并发安全地使用，请用
+// LoadFileFromCacheWith 并带上 qjs.WithThreadPinning()；该选项会在每次引擎操作
+// 期间把执行钉在单一 OS 线程上，配合已有的串行化锁彻底消除跨线程崩溃。
 func LoadFileFromCache(path string, vars map[string]interface{}, scriptHome ...string) (ctx *Context, existing bool, err error) {
 	return loadFileFromCache(path, vars, []Option{WithRequire()}, scriptHome)
 }
@@ -52,6 +58,12 @@ func LoadFileFromCache(path string, vars map[string]interface{}, scriptHome ...s
 //
 //	ctx, _, err := qjs.LoadFileFromCacheWith("rules.js", nil,
 //	    []qjs.Option{qjs.WithMemoryLimit(1 << 20)}, "/opt/js-libs")
+//
+// 并发安全提示：要让同一个缓存 Context 被多个 goroutine 同时驱动（例如
+// fasthttp 这类多 worker 服务），请务必带上 qjs.WithThreadPinning()：
+//
+//	ctx, _, err := qjs.LoadFileFromCacheWith("rules.js", nil,
+//	    []qjs.Option{qjs.WithThreadPinning()}, scriptHome...)
 //
 // require() 已经在两个入口里默认打开，不必再传 qjs.WithRequire()。
 // 搜索目录仍是最后一个变参。Option 也参与缓存键，同一文件用不同 Option

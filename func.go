@@ -303,26 +303,49 @@ func toJsResult(c *Context, v reflect.Value) C.JSValue {
 //	ctx.BindFunc("add", &add)
 //	fmt.Println(add(1, 2))
 func (c *Context) BindFunc(name string, fnVarPtr interface{}) error {
-	c.mu.lock()
-	defer c.mu.unlock()
-	if c.closed {
+	if c == nil || c.eng == nil {
 		return ErrClosed
 	}
-	g := C.qjs_global(c.c)
-	cname := C.CString(name)
-	fn := C.qjs_get_prop(c.c, g, cname)
-	C.free(unsafe.Pointer(cname))
-	C.JS_FreeValue(c.c, g)
-	if C.JS_IsException(fn) != 0 {
-		C.JS_FreeValue(c.c, fn)
-		return c.takeError()
+	var err error
+	// The whole lookup runs on the engine thread, not merely under c.mu.
+	// Taking the lock on the caller's thread serialises it against other
+	// goroutines but leaves quickjs executing on a foreign OS thread: the C
+	// stack guard would be anchored to that thread's stack (JS_UpdateStackTop
+	// inside qjs_get_prop) and a collection triggered while we are in here
+	// would scan the wrong stack. Both corrupt the runtime in ways that only
+	// surface much later, as a SIGSEGV inside an unrelated JS_Call.
+	//
+	// A false return means the task never ran, i.e. the engine is already
+	// stopped: returning the zero error would leave the caller's func variable
+	// nil and the next call through it would panic, so report closed instead.
+	if !c.submit(func() {
+		c.mu.lock()
+		defer c.mu.unlock()
+		if c.closed {
+			err = ErrClosed
+			return
+		}
+		g := C.qjs_global(c.c)
+		cname := C.CString(name)
+		fn := C.qjs_get_prop(c.c, g, cname)
+		C.free(unsafe.Pointer(cname))
+		C.JS_FreeValue(c.c, g)
+		if C.JS_IsException(fn) != 0 {
+			C.JS_FreeValue(c.c, fn)
+			err = c.takeError()
+			return
+		}
+		if C.qjs_is_function(c.c, fn) == 0 {
+			C.JS_FreeValue(c.c, fn)
+			err = fmt.Errorf("qjs: global %q is not a function", name)
+			return
+		}
+		defer C.JS_FreeValue(c.c, fn)
+		err = c.bindFuncValue(fn, fnVarPtr)
+	}) {
+		return ErrClosed
 	}
-	if C.qjs_is_function(c.c, fn) == 0 {
-		C.JS_FreeValue(c.c, fn)
-		return fmt.Errorf("qjs: global %q is not a function", name)
-	}
-	defer C.JS_FreeValue(c.c, fn)
-	return c.bindFuncValue(fn, fnVarPtr)
+	return err
 }
 
 // BindFuncs binds several global javascript functions at once. The map keys
@@ -340,15 +363,26 @@ func (c *Context) BindFuncs(bindings map[string]interface{}) error {
 // Bind binds the value (which must be a javascript function) to a golang func
 // variable.
 func (v *Value) Bind(fnVarPtr interface{}) error {
-	if err := v.check(); err != nil {
-		return err
+	if v == nil || v.eng == nil {
+		return ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
-		return errNotFunc
+	var err error
+	// As in BindFunc: a task that never ran would leave the caller's func
+	// variable nil while reporting success.
+	if !v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		if C.qjs_is_function(v.ctx.c, v.v) == 0 {
+			err = errNotFunc
+			return
+		}
+		err = v.ctx.bindFuncValue(v.v, fnVarPtr)
+	}) {
+		return ErrFreed
 	}
-	return v.ctx.bindFuncValue(v.v, fnVarPtr)
+	return err
 }
 
 func (c *Context) bindFuncValue(jsFn C.JSValue, fnVarPtr interface{}) error {
@@ -376,6 +410,34 @@ func (c *Context) bindFuncValue(jsFn C.JSValue, fnVarPtr interface{}) error {
 }
 
 func callJsFunc(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value) []reflect.Value {
+	zero := func() []reflect.Value {
+		res := make([]reflect.Value, ft.NumOut())
+		for i := range res {
+			res[i] = reflect.Zero(ft.Out(i))
+		}
+		return res
+	}
+	// The engine pointer is written once, at context creation, and never
+	// cleared, so this is a pure nil guard. Whether the context is closed is
+	// decided under the lock inside callJsFuncLocked -- together with
+	// fnVal.freed / fnVal.ctx, which are written under that same lock and must
+	// not be read from here.
+	if c == nil || c.eng == nil || fnVal == nil {
+		return zero()
+	}
+	var out []reflect.Value
+	c.submit(func() {
+		out = callJsFuncLocked(c, fnVal, ft, args)
+	})
+	if out == nil {
+		// submit did not run the task (engine stopped between the guard and the
+		// dispatch); callJsFuncLocked would have returned zeros anyway.
+		return zero()
+	}
+	return out
+}
+
+func callJsFuncLocked(c *Context, fnVal *Value, ft reflect.Type, args []reflect.Value) []reflect.Value {
 	c.mu.lock()
 	defer c.mu.unlock()
 

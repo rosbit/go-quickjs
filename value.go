@@ -9,6 +9,7 @@ import "C"
 import (
 	"math"
 	"runtime"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -16,7 +17,8 @@ import (
 // called or until its Context is closed.
 type Value struct {
 	ctx   *Context
-	id    uint64 // key of this value's entry in ctx.values, stable for its lifetime
+	eng   *engine // the engine goroutine owning the runtime this value lives in
+	id    uint64  // key of this value's entry in ctx.values, stable for its lifetime
 	v     C.JSValue
 	freed bool
 }
@@ -24,19 +26,14 @@ type Value struct {
 // Free releases the underlying JSValue. Calling Free twice is harmless, and so
 // is freeing a value whose context has already been closed.
 func (v *Value) Free() {
-	if v == nil {
+	if v == nil || v.eng == nil {
 		return
 	}
-	// ctx is only ever nil'd under the engine lock of the context it points at,
-	// and a *Value never changes owner, so reading it once up front is enough to
-	// find the lock to take.
-	c := v.ctx
-	if c == nil {
-		return
-	}
-	c.mu.lock()
-	defer c.mu.unlock()
-	v.freeLocked()
+	v.submit(func() {
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		v.freeLocked()
+	})
 }
 
 // freeLocked is Free for a caller that already holds the engine lock, and it is
@@ -74,14 +71,24 @@ func (v *Value) Context() *Context {
 
 // Freed reports whether the value has been released.
 func (v *Value) Freed() bool {
-	// A nil context means the value was already freed: there is no engine lock
-	// left to take, so report it as released without touching anything.
-	if v == nil || v.ctx == nil {
+	if v == nil || v.eng == nil {
 		return true
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	return v.freed || v.ctx.closed
+	// If the engine has stopped (its context was Closed or finalized), the value
+	// is unreachable from the C side and must be reported as freed without
+	// touching the dead engine.
+	select {
+	case <-v.eng.done:
+		return true
+	default:
+	}
+	var freed bool
+	v.submit(func() {
+		v.ctx.mu.lock()
+		freed = v.freed || v.ctx.closed
+		v.ctx.mu.unlock()
+	})
+	return freed
 }
 
 func (v *Value) check() error {
@@ -92,6 +99,37 @@ func (v *Value) check() error {
 		return ErrClosed
 	}
 	return nil
+}
+
+// submit runs f on the engine thread, mirroring Context.submit: it runs inline
+// when the caller is already on the engine thread or inside a JS->Go callback,
+// and otherwise queues and waits.
+func (v *Value) submit(f func()) bool {
+	if v == nil || v.eng == nil {
+		return false
+	}
+	c := v.ctx
+	if c == nil {
+		// The value has been freed, so the only thing the task could do is a
+		// no-op. The engine may already be stopped (its context was closed), so
+		// enqueuing here would block forever on a channel with no reader.
+		return false
+	}
+	id := v.eng.threadID.Load()
+	if id != 0 && (currentThread() == id || currentThread() == atomic.LoadInt64(&c.mu.cbThread)) {
+		f()
+		return true
+	}
+	// The engine may have been stopped already (the context was Closed, or its
+	// finalizer ran): its loop has exited and there is no reader for e.tasks, so
+	// enqueue would block forever. closeLocked already released every JSValue, so
+	// there is nothing left for the task to do.
+	select {
+	case <-v.eng.done:
+		return false
+	default:
+	}
+	return v.eng.enqueue(f)
 }
 
 // IsUndefined reports whether the value is `undefined`.
@@ -133,92 +171,162 @@ func (v *Value) IsError() bool {
 }
 
 func (v *Value) test(f func() bool) bool {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return false
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if v.freed || v.ctx.closed {
-		return false
-	}
-	return f()
+	var res bool
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		res = f()
+	})
+	return res
 }
 
 // Bool converts the value to a golang bool.
 func (v *Value) Bool() bool {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return false
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	return C.JS_ToBool(v.ctx.c, v.v) != 0
+	var ret bool
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		ret = C.JS_ToBool(v.ctx.c, v.v) != 0
+	})
+	return ret
 }
 
 // Int64 converts the value to an int64.
 func (v *Value) Int64() int64 {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return 0
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	var i C.int64_t
-	C.qjs_to_int64(v.ctx.c, &i, v.v)
-	return int64(i)
+	var i int64
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		var ci C.int64_t
+		C.qjs_to_int64(v.ctx.c, &ci, v.v)
+		i = int64(ci)
+	})
+	return i
 }
 
 // Float64 converts the value to a float64.
 func (v *Value) Float64() float64 {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return 0
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	var f C.double
-	C.qjs_to_float64(v.ctx.c, &f, v.v)
-	return float64(f)
+	var f float64
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		var cf C.double
+		C.qjs_to_float64(v.ctx.c, &cf, v.v)
+		f = float64(cf)
+	})
+	return f
 }
 
 // String returns the value as a string: strings are returned as-is, anything
 // else is serialized with JSON.stringify.
 func (v *Value) String() string {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return "<freed>"
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if C.qjs_is_string(v.v) != 0 {
-		return cGoString(v.ctx.c, v.v)
-	}
-	s, _ := jsonStringify(v.ctx, v.v)
-	if s == "" {
-		return "undefined"
-	}
-	return s
+	var ret string
+	v.submit(func() {
+		if v.check() != nil {
+			ret = "<freed>"
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if C.qjs_is_string(v.v) != 0 {
+			ret = cGoString(v.ctx.c, v.v)
+			return
+		}
+		s, _ := jsonStringify(v.ctx, v.v)
+		if s == "" {
+			ret = "undefined"
+			return
+		}
+		ret = s
+	})
+	return ret
 }
 
 // Interface converts the value to a plain golang value:
 // nil, bool, int64, float64, string, []interface{}, map[string]interface{} or
 // *Value for functions.
 func (v *Value) Interface() (interface{}, error) {
-	if err := v.check(); err != nil {
-		return nil, err
-	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if v.freed || v.ctx.closed {
+	if v == nil || v.eng == nil {
 		return nil, ErrFreed
 	}
-	return fromJsValue(v.ctx, v.v)
+	var ret interface{}
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = v.check()
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		ret, err = fromJsValue(v.ctx, v.v)
+	})
+	return ret, err
 }
 
 // JSON serializes the value with JSON.stringify.
 func (v *Value) JSON() (string, error) {
-	if err := v.check(); err != nil {
-		return "", err
+	if v == nil || v.eng == nil {
+		return "", ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	return jsonStringify(v.ctx, v.v)
+	var ret string
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = v.check()
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		ret, err = jsonStringify(v.ctx, v.v)
+	})
+	return ret, err
 }
 
 // Pretty renders the value with QuickJS' built-in pretty-printer
@@ -228,19 +336,32 @@ func (v *Value) JSON() (string, error) {
 // circular references and BigInt. The output is plain text (no ANSI color);
 // the console wraps it in the structural color.
 func (v *Value) Pretty() string {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return "undefined"
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	var cstr *C.char
-	var clen C.size_t
-	C.qjs_print_value(v.ctx.c, v.v, &cstr, &clen)
-	if cstr == nil {
-		return "undefined"
-	}
-	defer C.qjs_print_value_free(cstr)
-	return C.GoStringN(cstr, C.int(clen))
+	var ret string
+	v.submit(func() {
+		if v.check() != nil {
+			ret = "undefined"
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			ret = "undefined"
+			return
+		}
+		var cstr *C.char
+		var clen C.size_t
+		C.qjs_print_value(v.ctx.c, v.v, &cstr, &clen)
+		if cstr == nil {
+			ret = "undefined"
+			return
+		}
+		defer C.qjs_print_value_free(cstr)
+		ret = C.GoStringN(cstr, C.int(clen))
+	})
+	return ret
 }
 
 // isGoObject reports whether the value is a GoObject proxy standing for an
@@ -248,13 +369,24 @@ func (v *Value) Pretty() string {
 // reflection renderer (fields + [Function: M]) and the upstream JS
 // pretty-printer.
 func (v *Value) isGoObject() bool {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return false
 	}
-	if _, ok := goObjReflect(v.ctx, v.v); ok {
-		return true
-	}
-	return false
+	var ret bool
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		if _, ok := goObjReflect(v.ctx, v.v); ok {
+			ret = true
+		}
+	})
+	return ret
 }
 
 // isPlainJs reports whether the value is a plain JS object (JS_CLASS_OBJECT)
@@ -265,123 +397,216 @@ func (v *Value) isGoObject() bool {
 // class IDs ("JS_CLASS_OBJECT = 1 /* must be first */" in quickjs.c); Go
 // proxies carry their own registered class id and are excluded here too.
 func (v *Value) isPlainJs() bool {
-	if v.check() != nil {
+	if v == nil || v.eng == nil {
 		return false
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if v.freed || v.ctx.closed {
-		return false
-	}
-	if C.qjs_is_object(v.v) == 0 {
-		return false
-	}
-	id := int(C.JS_GetClassID(v.v))
-	return id == 1 || id == 2
+	var ret bool
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		if C.qjs_is_object(v.v) == 0 {
+			return
+		}
+		id := int(C.JS_GetClassID(v.v))
+		ret = id == 1 || id == 2
+	})
+	return ret
 }
 
 // Get reads a property of the value.
 func (v *Value) Get(key string) (*Value, error) {
-	if err := v.check(); err != nil {
-		return nil, err
+	if v == nil || v.eng == nil {
+		return nil, ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	ckey := C.CString(key)
-	prop := C.qjs_get_prop(v.ctx.c, v.v, ckey)
-	C.free(unsafe.Pointer(ckey))
-	return v.ctx.wrapGet(prop)
+	var ret *Value
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		ckey := C.CString(key)
+		prop := C.qjs_get_prop(v.ctx.c, v.v, ckey)
+		C.free(unsafe.Pointer(ckey))
+		ret, err = v.ctx.wrapGet(prop)
+	})
+	return ret, err
 }
 
 // Set writes a property of the value.
 func (v *Value) Set(key string, val interface{}) error {
-	if err := v.check(); err != nil {
-		return err
+	if v == nil || v.eng == nil {
+		return ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	jv, err := toJsValue(v.ctx, val)
-	if err != nil {
-		return err
-	}
-	ckey := C.CString(key)
-	ret := C.qjs_set_prop(v.ctx.c, v.v, ckey, jv) // consumes jv
-	C.free(unsafe.Pointer(ckey))
-	if ret < 0 {
-		return errSetProp
-	}
-	return nil
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		jv, e := toJsValue(v.ctx, val)
+		if e != nil {
+			err = e
+			return
+		}
+		ckey := C.CString(key)
+		ret := C.qjs_set_prop(v.ctx.c, v.v, ckey, jv) // consumes jv
+		C.free(unsafe.Pointer(ckey))
+		if ret < 0 {
+			err = errSetProp
+		}
+	})
+	return err
 }
 
 // Call invokes the value as a function, using the value itself as `this`.
 func (v *Value) Call(args ...interface{}) (*Value, error) {
-	if err := v.check(); err != nil {
-		return nil, err
+	if v == nil || v.eng == nil {
+		return nil, ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if C.qjs_is_function(v.ctx.c, v.v) == 0 {
-		return nil, errNotFunc
-	}
-	return v.ctx.callLocked(v.v, v.v, args...)
+	var ret *Value
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		if C.qjs_is_function(v.ctx.c, v.v) == 0 {
+			err = errNotFunc
+			return
+		}
+		ret, err = v.ctx.callLocked(v.v, v.v, args...)
+	})
+	return ret, err
 }
 
 // CallMethod invokes `obj[name](args...)` with the value as `this`.
 func (v *Value) CallMethod(name string, args ...interface{}) (*Value, error) {
-	if err := v.check(); err != nil {
-		return nil, err
+	if v == nil || v.eng == nil {
+		return nil, ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	cname := C.CString(name)
-	fn := C.qjs_get_prop(v.ctx.c, v.v, cname)
-	C.free(unsafe.Pointer(cname))
-	if C.JS_IsException(fn) != 0 {
-		C.JS_FreeValue(v.ctx.c, fn)
-		return nil, v.ctx.takeError()
-	}
-	if C.qjs_is_function(v.ctx.c, fn) == 0 {
-		C.JS_FreeValue(v.ctx.c, fn)
-		return nil, errNotFunc
-	}
-	defer C.JS_FreeValue(v.ctx.c, fn)
-	return v.ctx.callLocked(fn, v.v, args...)
+	var ret *Value
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		cname := C.CString(name)
+		fn := C.qjs_get_prop(v.ctx.c, v.v, cname)
+		C.free(unsafe.Pointer(cname))
+		if C.JS_IsException(fn) != 0 {
+			C.JS_FreeValue(v.ctx.c, fn)
+			err = v.ctx.takeError()
+			return
+		}
+		if C.qjs_is_function(v.ctx.c, fn) == 0 {
+			C.JS_FreeValue(v.ctx.c, fn)
+			err = errNotFunc
+			return
+		}
+		defer C.JS_FreeValue(v.ctx.c, fn)
+		ret, err = v.ctx.callLocked(fn, v.v, args...)
+	})
+	return ret, err
 }
 
 // Keys returns the enumerable property names of the value.
 func (v *Value) Keys() ([]string, error) {
-	if err := v.check(); err != nil {
-		return nil, err
+	if v == nil || v.eng == nil {
+		return nil, ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	return propertyNames(v.ctx, v.v)
+	var ret []string
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		ret, err = propertyNames(v.ctx, v.v)
+	})
+	return ret, err
 }
 
 // Length returns the "length" property, 0 if it is not a number.
 func (v *Value) Length() int {
-	if err := v.check(); err != nil {
+	if v == nil || v.eng == nil {
 		return 0
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	if C.qjs_is_array(v.ctx.c, v.v) == 0 {
-		return 0
-	}
-	l := C.qjs_get_prop(v.ctx.c, v.v, cLength())
-	defer C.JS_FreeValue(v.ctx.c, l)
-	return int(v.ctx.toInt64(l))
+	var ret int
+	v.submit(func() {
+		if v.check() != nil {
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			return
+		}
+		if C.qjs_is_array(v.ctx.c, v.v) == 0 {
+			return
+		}
+		l := C.qjs_get_prop(v.ctx.c, v.v, cLength())
+		defer C.JS_FreeValue(v.ctx.c, l)
+		ret = int(v.ctx.toInt64(l))
+	})
+	return ret
 }
 
 // Elem returns the i-th element of an array or object.
 func (v *Value) Elem(i int) (*Value, error) {
-	if err := v.check(); err != nil {
-		return nil, err
+	if v == nil || v.eng == nil {
+		return nil, ErrFreed
 	}
-	v.ctx.mu.lock()
-	defer v.ctx.mu.unlock()
-	e := C.qjs_get_prop_u32(v.ctx.c, v.v, C.uint32_t(i))
-	return v.ctx.wrapGet(e)
+	var ret *Value
+	var err error
+	v.submit(func() {
+		if v.check() != nil {
+			err = ErrFreed
+			return
+		}
+		v.ctx.mu.lock()
+		defer v.ctx.mu.unlock()
+		if v.freed || v.ctx.closed {
+			err = ErrFreed
+			return
+		}
+		e := C.qjs_get_prop_u32(v.ctx.c, v.v, C.uint32_t(i))
+		ret, err = v.ctx.wrapGet(e)
+	})
+	return ret, err
 }
 
 // ---------------------------------------------------------------------------
