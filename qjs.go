@@ -33,6 +33,7 @@ package quickjs
 #include <stdlib.h>
 #include "qjs-helper.h"
 #include "go-proxy.h"
+#include "go-func.h"
 */
 import "C"
 
@@ -223,9 +224,10 @@ func NewContext(opts ...Option) (*Context, error) {
 // implementation detail of the Context that callers never need to name.
 //
 // Nothing here takes a global lock. Creating an engine is thread-safe: quickjs
-// builds every runtime on its own heap, and the only shared resource touched --
-// the class id minted by registerGoObjectClass -- is handed out under quickjs'
-// own js_class_id_mutex, so two concurrent calls are idempotent.
+// builds every runtime on its own heap, and the only shared resources touched --
+// the class ids minted for the GoObject and GoFuncData classes -- are handed
+// out under quickjs' own js_class_id_mutex, so two concurrent calls are
+// idempotent.
 func newRuntime(opts ...Option) (*Context, error) {
 	o := &options{
 		stdout: os.Stdout,
@@ -242,7 +244,19 @@ func newRuntime(opts ...Option) (*Context, error) {
 		return nil, errors.New("qjs: failed to create quickjs runtime")
 	}
 	C.qjs_set_module_loader(rt)
-	C.registerGoObjectClass(rt)
+	if C.registerGoObjectClass(rt) != 0 {
+		C.JS_FreeRuntime(rt)
+		return nil, errors.New("qjs: failed to register the golang object class")
+	}
+	// The GoFuncData class carries the golang registry id of every js function
+	// that stands for a golang func, and its finalizer is what releases that
+	// entry once javascript drops the function. A failed registration would go
+	// unnoticed -- the objects would still work, they would just never be
+	// freed -- so it is a hard error here, not an ignored return value.
+	if C.registerGoFuncClass(rt) != 0 {
+		C.JS_FreeRuntime(rt)
+		return nil, errors.New("qjs: failed to register the golang function class")
+	}
 	if o.memoryLimit > 0 {
 		C.JS_SetMemoryLimit(rt, C.size_t(o.memoryLimit))
 	}
@@ -268,6 +282,13 @@ func newRuntime(opts ...Option) (*Context, error) {
 		C.JS_FreeRuntime(rt)
 		return nil, errors.New("qjs: failed to create quickjs context")
 	}
+	// Only now, so that a failure above leaves nothing behind to unregister.
+	// It has to be in place before installBuiltins below, which is the first
+	// thing that registers a golang function (console.log), and before any
+	// javascript can run, because the finalizer that releases an entry looks
+	// the store up by runtime.
+	registerFuncStore(rt, r.funcs)
+
 	ctx := &Context{
 		rt:     r,
 		c:      c,
@@ -331,10 +352,21 @@ func teardown(r *jsRuntime, c *Context) {
 		return
 	}
 	if r.funcs != nil {
+		// The finalizers below drop entries one by one as JS_FreeRuntime
+		// collects the surviving function objects; this is only a safety net
+		// for ids that never got a wrapper to be freed by (registerGoFunc
+		// mints the id before the object exists).
 		r.funcs.clear()
 	}
 	if r.rt != nil {
-		C.JS_FreeRuntime(r.rt)
+		rt := r.rt
+		C.JS_FreeRuntime(rt)
+		// JS_FreeRuntime runs the finalizers of the objects still alive in it,
+		// and each of those looks its funcStore up by runtime, so the mapping
+		// has to outlive the call. Dropping it afterwards keeps a freed runtime
+		// address from being inherited by a new runtime that the allocator
+		// happens to hand the same pointer to.
+		unregisterFuncStore(rt, r.funcs)
 		r.closed = true
 		r.rt = nil
 	}
@@ -852,6 +884,21 @@ var (
 	// Only a weak pointer is stored, so the registry never keeps a context alive
 	// and the *Context finalizer can still run after a forgotten Close.
 	ctxRegistry sync.Map // uintptr -> weak.Pointer[Context]
+
+	// rtFuncStores maps a JSRuntime* (as uintptr) to the funcStore holding the
+	// golang functions that were handed to javascript in it.
+	//
+	// A funcStore is per runtime rather than global, so that two contexts
+	// driving two runtimes in parallel never contend on it, and so that a
+	// callback can never reach a golang func belonging to another engine. But
+	// the class finalizer that releases an entry (goFreeFuncId, see go-func.c)
+	// is handed the raw JSRuntime* and nothing else, so it needs this way back
+	// to the store.
+	//
+	// The entry is dropped only after JS_FreeRuntime has returned, i.e. after
+	// the last of those finalizers has run. Registering happens before any
+	// javascript executes, because installBuiltins registers console.log.
+	rtFuncStores sync.Map // uintptr -> *funcStore
 	// liveEngines counts the engines (contexts) that are currently alive. It
 	// exists so the finalizer test can observe that a leaked engine is really
 	// reclaimed; production code never reads it.
@@ -881,6 +928,39 @@ func lookupContext(p *C.JSContext) *Context {
 
 func (c *Context) ctxKey() uintptr {
 	return uintptr(unsafe.Pointer(c.c))
+}
+
+// registerFuncStore, unregisterFuncStore and lookupFuncStore manage the
+// runtime -> funcStore mapping. Like ctxRegistry it is a sync.Map, so the
+// lookup the finalizers make never takes a lock that could be held while the
+// engine lock is.
+func registerFuncStore(rt *C.JSRuntime, s *funcStore) {
+	rtFuncStores.Store(uintptr(unsafe.Pointer(rt)), s)
+}
+
+// unregisterFuncStore is a conditional delete on purpose. It runs after
+// JS_FreeRuntime has returned, that is after the runtime address became free,
+// and a goroutine creating an engine at that moment can be handed the very
+// same address and register its own store under this key first. Deleting
+// unconditionally would then take that new engine's mapping away and leave its
+// javascript unable to release a single golang function. Comparing the value
+// closes the window: only the entry this call put there is removed.
+func unregisterFuncStore(rt *C.JSRuntime, s *funcStore) {
+	if rt == nil {
+		return
+	}
+	rtFuncStores.CompareAndDelete(uintptr(unsafe.Pointer(rt)), s)
+}
+
+func lookupFuncStore(rt *C.JSRuntime) *funcStore {
+	if rt == nil {
+		return nil
+	}
+	s, ok := rtFuncStores.Load(uintptr(unsafe.Pointer(rt)))
+	if !ok {
+		return nil
+	}
+	return s.(*funcStore)
 }
 
 // liveContextCount reports how many engines are currently alive. It exists only

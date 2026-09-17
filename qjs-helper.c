@@ -9,6 +9,7 @@
  *      implementation.
  */
 #include "qjs-helper.h"
+#include "go-func.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -58,18 +59,22 @@ JSValue qjs_get_value(const JSValue *vals, int i) {
  * Build a JS function whose body is a golang func. The golang func is not
  * referenced by any C pointer: only its registry id (a plain uint32) travels
  * through quickjs, so no Go pointer is ever stored in C memory.
+ *
+ * The id goes in wrapped: makeGoFuncData puts it in a small js object of ours
+ * whose finalizer releases the registry entry once javascript has dropped the
+ * function. The function object itself is built by quickjs and stays exactly
+ * what it always was -- swapping the plain uint32 for that wrapper is the only
+ * change, and the callback reads the id out of it.
  */
 JSValue qjs_new_go_func(JSContext *ctx, int length, uint32_t id) {
-    JSValue data = JS_NewUint32(ctx, id);
-    JSValue f = JS_NewCFunctionData(ctx, qjsGoFuncCallback, length, 0, 1, &data);
+    JSValue data = makeGoFuncData(ctx, id);
+    JSValue f;
+    if (JS_IsException(data)) {
+        return data;
+    }
+    f = JS_NewCFunctionData(ctx, qjsGoFuncCallback, length, 0, 1, &data);
     JS_FreeValue(ctx, data);
     return f;
-}
-
-uint32_t qjs_to_uint32(JSContext *ctx, JSValueConst v) {
-    uint32_t u = 0;
-    JS_ToUint32(ctx, &u, v);
-    return u;
 }
 
 JSValue qjs_throw_error(JSContext *ctx, const char *msg) {

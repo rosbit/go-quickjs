@@ -18,7 +18,6 @@ void          qjs_set_value(JSValue *vals, int i, JSValue v);
 JSValue       qjs_get_value(const JSValue *vals, int i);
 
 JSValue       qjs_new_go_func(JSContext *ctx, int length, uint32_t id);
-uint32_t      qjs_to_uint32(JSContext *ctx, JSValueConst v);
 JSValue       qjs_throw_error(JSContext *ctx, const char *msg);
 int           qjs_set_prop(JSContext *ctx, JSValueConst obj, const char *key, JSValue val);
 int           qjs_define_prop(JSContext *ctx, JSValueConst obj, const char *key, JSValue val);

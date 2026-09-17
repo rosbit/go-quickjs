@@ -1,6 +1,7 @@
 package quickjs
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -76,6 +77,120 @@ func TestContextGC(t *testing.T) {
 	}
 	defer ctx.Close()
 	ctx.GC() // must not panic or error
+}
+
+// TestProxiedFuncsAreReleasedWithTheJsFunction locks in the leak that made a
+// long-running db-pusher process grow without bound.
+//
+// Reading a func out of a proxied golang map or struct -- every
+// `clog.error(...)`, every `db.runSQL(...)` in a script that drives golang
+// through namespaced builtins -- builds a brand new js function, and each of
+// those used to occupy a registry entry for the whole life of the context:
+// nothing ever told golang that javascript had dropped the function. A script
+// calling such a builtin from inside its row loop therefore leaked one entry
+// per row, forever, on a context that LoadFileFromCache keeps alive.
+//
+// The release is driven by the finalizer of the wrapper the registry id
+// travels in, so it takes a quickjs collection to observe: the loop below
+// makes javascript drop each function it reads, then forces the GC.
+func TestProxiedFuncsAreReleasedWithTheJsFunction(t *testing.T) {
+	const calls = 20000
+
+	ctx, err := NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Close()
+
+	// Namespaced builtins: the script reaches them through a proxy, which is
+	// the shape that leaked. Registered as plain globals they would be
+	// converted once and prove nothing.
+	vars := map[string]interface{}{
+		"clog": map[string]interface{}{
+			"error": func(string) {},
+			"info":  func(string) {},
+		},
+		"utils": map[string]interface{}{
+			"fen2yuan": func(f float64) float64 { return f / 100 },
+		},
+	}
+	if _, err := ctx.Eval("1", vars); err != nil {
+		t.Fatal(err)
+	}
+	base := ctx.rt.funcs.size()
+
+	script := fmt.Sprintf("var total = 0; for (var i = 0; i < %d; i++) { "+
+		"total += utils.fen2yuan(i); if (i %% 1000 === 0) clog.info('tick'); } total", calls)
+	if _, err := ctx.Eval(script, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each function the loop read is unreachable now; the collection runs the
+	// wrapper finalizers that drop their registry entries.
+	ctx.GC()
+
+	// A handful may still be pinned by an inline cache, so allow a little
+	// slack -- but the leak was one entry per call, so the difference is
+	// unmistakable either way.
+	got := ctx.rt.funcs.size()
+	if got > base+16 {
+		t.Fatalf("registry grew with the calls: %d entries after %d proxied calls, want ~%d",
+			got, calls, base)
+	}
+}
+
+// TestCloseUnregistersFuncStore asserts the runtime -> funcStore mapping does
+// not outlive the runtime it points at. A stale key would pin the store, and
+// would let a later engine that the allocator hands the same address inherit
+// another context's entries.
+func TestCloseUnregistersFuncStore(t *testing.T) {
+	ctx, err := NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := ctx.rt.rt // read before Close clears it
+	if lookupFuncStore(rt) == nil {
+		t.Fatal("the func store must be reachable by runtime while the context is alive")
+	}
+	if err := ctx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if lookupFuncStore(rt) != nil {
+		t.Fatal("Close must unregister the func store with the runtime")
+	}
+}
+
+// TestUnregisterFuncStoreIsConditional asserts that unregistering only removes
+// the entry it owns. It runs after JS_FreeRuntime, when the runtime address is
+// free again: an engine created at that moment can be handed the same address
+// and register its own store under this key first, and an unconditional delete
+// would take that engine's mapping away -- leaving its javascript unable to
+// release a single golang function.
+func TestUnregisterFuncStoreIsConditional(t *testing.T) {
+	ctx, err := NewContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := ctx.rt.rt // read before Close clears it
+	own := ctx.rt.funcs
+
+	other := newFuncStore()
+	registerFuncStore(rt, other) // as a new engine at the same address would
+
+	unregisterFuncStore(rt, own)
+	if got := lookupFuncStore(rt); got != other {
+		t.Fatalf("unregistering removed an entry it does not own: got %v, want %v", got, other)
+	}
+
+	unregisterFuncStore(rt, other)
+	if lookupFuncStore(rt) != nil {
+		t.Fatal("unregistering must remove the entry when it is the current one")
+	}
+
+	registerFuncStore(rt, own) // put it back, Close still has to find it
+	if err := ctx.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestCloseFreesValuesPendingFinalization locks in a leak that a plain Go GC

@@ -3,6 +3,7 @@ package quickjs
 /*
 #include <stdlib.h>
 #include "qjs-helper.h"
+#include "go-func.h"
 */
 import "C"
 
@@ -22,6 +23,13 @@ import (
 // A golang func is never referenced by a C pointer: only its (plain) id is
 // stored inside the JS function object. When the runtime is closed the registry
 // is dropped, so a callback can never reach a freed context.
+//
+// Entries are freed the moment javascript drops the function that carries
+// them, not only when the context closes. The mechanism is the GoFuncData
+// wrapper the id travels in (see go-func.c): its class finalizer calls back
+// into goFreeFuncId, which removes the entry. Without that, every property
+// read of a proxied golang map/struct that yields a func registered a new
+// entry for good -- and those reads sit inside the row loops of real scripts.
 // ---------------------------------------------------------------------------
 
 type goFunc struct {
@@ -64,10 +72,27 @@ func (s *funcStore) get(id uint32) *goFunc {
 	return s.funcs[id]
 }
 
+// remove drops one entry. It is called from goFreeFuncId -- the finalizer of
+// the js wrapper the id travels in -- so it runs whenever javascript collects
+// a function it was handed, which is what bounds the registry.
+func (s *funcStore) remove(id uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.funcs, id)
+}
+
 func (s *funcStore) clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.funcs = make(map[uint32]*goFunc)
+}
+
+// size reports how many entries the store holds. It exists so tests can watch
+// the registry shrink; production code never reads it.
+func (s *funcStore) size() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.funcs)
 }
 
 // registerGoFunc builds a JS function calling the golang func fn.
@@ -85,7 +110,28 @@ func registerGoFunc(c *Context, fn reflect.Value) (C.JSValue, error) {
 	if length < 0 {
 		length = 0
 	}
-	return C.qjs_new_go_func(c.c, C.int(length), C.uint32_t(id)), nil
+	f := C.qjs_new_go_func(c.c, C.int(length), C.uint32_t(id))
+	if C.JS_IsException(f) != 0 {
+		// No wrapper was built, so no finalizer will ever fire for this id:
+		// drop it here instead of leaving it until the context closes.
+		c.rt.funcs.remove(id)
+	}
+	return f, nil
+}
+
+// goFreeFuncId releases the registry entry behind a js function that has just
+// been collected. It is the finalizer of the GoFuncData wrapper (go-func.c),
+// which is why it arrives with the C runtime rather than a context: a finalizer
+// has no JSContext to look up. It must not touch the engine lock -- javascript
+// is not running at this point, and the entry it drops belongs to nobody.
+//
+//export goFreeFuncId
+func goFreeFuncId(rt *C.JSRuntime, idx C.uint32_t) {
+	s := lookupFuncStore(rt)
+	if s == nil {
+		return
+	}
+	s.remove(uint32(idx))
 }
 
 // nameGoFunc gives a registered go function a javascript `name` property, so
@@ -130,7 +176,10 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 	c.mu.enterCallback()
 	defer c.mu.exitCallback()
 
-	id := C.qjs_to_uint32(ctx, *funcData)
+	// func_data[0] is the GoFuncData wrapper holding the registry id; the
+	// wrapper's finalizer is what releases the entry when javascript drops
+	// this function.
+	id := C.restoreGoFuncId(*funcData)
 	gf := c.rt.funcs.get(uint32(id))
 	if gf == nil || gf.fn.Kind() != reflect.Func {
 		return C.qjs_throw_error(ctx, ccstr("qjs: go function no longer available"))
