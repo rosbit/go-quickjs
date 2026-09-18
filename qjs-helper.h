@@ -63,10 +63,31 @@ extern const char *qjs_stack_str;
  * recursion -- what the guard is really for -- never does.
  */
 static inline void qjs_stack_guard(JSContext *ctx) {
-	JS_UpdateStackTop(JS_GetRuntime(ctx));
+	JSRuntime *rt = ctx ? JS_GetRuntime(ctx) : NULL;
+	if (rt != NULL) {
+		JS_UpdateStackTop(rt);
+	}
 }
 static inline void qjs_stack_guard_rt(JSRuntime *rt) {
 	JS_UpdateStackTop(rt);
+}
+
+/*
+ * qjs_ctx_alive reports whether ctx is usable: non NULL and still attached to a
+ * runtime. golang releases the JSContext on the engine thread and clears its own
+ * pointer under the engine lock, so a context reaches the interpreter here only
+ * if the pointer golang passed was already cleared, or if the block was recycled
+ * by a later allocation.
+ *
+ * JS_GetRuntime(ctx) reads ctx->rt, i.e. offset 8 of the context, so a dead
+ * context surfaces as a SIGSEGV on address 0x8 (rdi=0, "signal arrived during
+ * cgo execution"). Every entry point that would otherwise hand ctx to the
+ * interpreter checks this first and returns JS_EXCEPTION, so the failure is
+ * reported as a javascript exception golang can turn into an error instead of
+ * killing the process.
+ */
+static inline int qjs_ctx_alive(JSContext *ctx) {
+	return ctx != NULL && JS_GetRuntime(ctx) != NULL;
 }
 
 /* ---- thread identity ---- */
@@ -153,6 +174,9 @@ static inline JSValue qjs_get_prop_u32(JSContext *ctx, JSValueConst obj, uint32_
 }
 static inline JSValue qjs_call(JSContext *ctx, JSValueConst fn, JSValueConst thisVal,
                                int argc, JSValue *argv) {
+	if (!qjs_ctx_alive(ctx)) {
+		return JS_EXCEPTION;
+	}
 	qjs_stack_guard(ctx);
 	return JS_Call(ctx, fn, thisVal, argc, argv);
 }
@@ -162,6 +186,9 @@ static inline void qjs_free_value(JSContext *ctx, JSValue v) { JS_FreeValue(ctx,
 /* ---- eval ---- */
 static inline JSValue qjs_eval(JSContext *ctx, const char *buf, size_t len,
                                const char *filename, int flags) {
+	if (!qjs_ctx_alive(ctx)) {
+		return JS_EXCEPTION;
+	}
 	qjs_stack_guard(ctx);
 	return JS_Eval(ctx, buf, len, filename, flags);
 }

@@ -41,6 +41,25 @@ static int go_obj_get_own_property(JSContext *ctx, JSPropertyDescriptor *desc,
     if (!goObjHas(ctx, obj, prop)) {
         return 0;
     }
+    /*
+     * quickjs also calls this hook with desc == NULL, only to ask whether the
+     * property exists. The contract (quickjs.h) is "if 1 is returned, the
+     * property descriptor 'desc' is filled if != NULL", so with a NULL
+     * descriptor the hook must not touch it. quickjs does this in every
+     * for...in iteration (quickjs.c:16494, "check if the property was
+     * deleted"), in Object.prototype.hasOwnProperty (40419),
+     * propertyIsEnumerable (40445) and in getOwnPropertyNames with an
+     * exclusion object (16961). Object.keys never does, because quickjs drops
+     * GPN_ENUM_ONLY for objects that implement get_own_property_names (16949).
+     *
+     * The missing check below used to write through the NULL pointer and kill
+     * the process with SIGSEGV inside qjs_call: on x86-64 at address 0x8
+     * (desc->value), on arm64 at address 0x0 (desc->flags), with the
+     * descriptor register holding 0.
+     */
+    if (desc == NULL) {
+        return 1;
+    }
     JSValue v = goObjGet(ctx, obj, prop, obj);
     if (JS_IsException(v)) {
         return -1;

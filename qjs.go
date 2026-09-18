@@ -986,6 +986,17 @@ func freeAll(c *Context, vals []C.JSValue) {
 
 // invoke a js function. The caller must hold c.mu and owns fn/thisVal.
 func (c *Context) callLocked(fn C.JSValue, thisVal C.JSValue, args ...interface{}) (*Value, error) {
+	// closeLocked releases the JSContext under this same lock and clears c.c
+	// with it, so a call that gets here after a teardown would hand a NULL
+	// context to the interpreter. That is not a benign no-op: JS_GetRuntime
+	// reads offset 8 of the context, so the first thing qjs_call does is load
+	// from address 0x8 and the process dies with SIGSEGV (rdi=0, addr=0x8) --
+	// exactly the crash this guard turns into an ordinary ErrClosed. Every
+	// caller checks c.closed before dispatching, but the check happens before
+	// the task is queued; this one happens on the engine thread, after it ran.
+	if c.c == nil || c.closed {
+		return nil, ErrClosed
+	}
 	n := len(args)
 	var jsArgs *C.JSValue
 	if n > 0 {
