@@ -155,6 +155,13 @@ type Context struct {
 	modDir  string // directory of the module loaded most recently
 
 	convDepth int // nesting of the value being converted to js, see maxConvDepth
+
+	// slicesAsArrays makes every golang slice/array travel as a real js Array
+	// instead of a GoObject proxy. Read-only after creation; see
+	// WithSlicesAsArrays. It is consulted on the hot path of reflectToJs (once
+	// per property read on a proxy), so it is a plain bool set before the engine
+	// starts rather than an interface or a function.
+	slicesAsArrays bool
 }
 
 type options struct {
@@ -169,6 +176,9 @@ type options struct {
 	// threadPinning pins each engine-lock critical section to a single OS thread
 	// (see WithThreadPinning). It is set once at Context creation.
 	threadPinning bool
+	// slicesAsArrays hands golang slices/arrays over as real js Arrays instead
+	// of GoObject proxies (see WithSlicesAsArrays). Set once, at creation.
+	slicesAsArrays bool
 }
 
 // Option customizes a Context (and its underlying runtime).
@@ -235,6 +245,57 @@ func WithConsoleWriter(stdout, stderr io.Writer) Option {
 // model supersedes it and fixes both.)
 func WithThreadPinning() Option { return func(o *options) { o.threadPinning = true } }
 
+// WithSlicesAsArrays hands every golang slice and array to javascript as a real
+// js Array instead of a GoObject proxy. Flip it on when javascript code expects
+// array semantics from golang data -- the proxy is an ordinary object, so the
+// two differ in exactly the places array code relies on:
+//
+//	Array.isArray(v)                  // true       (proxy: false)
+//	v instanceof Array                // true       (false)
+//	v.forEach / map / filter / find  // work       (undefined)
+//	[...v], for (const x of v)        // work       (throws "not iterable")
+//	JSON.stringify(v)                 // "[1,2]"    ('{"0":1,"1":2}')
+//	Object.prototype.toString.call(v) // [object Array] ([object Object])
+//
+// Maps, structs and functions are untouched: they keep travelling as proxies
+// and stay lazy and writable, so the usual shape of a json body decoded into
+// interface{} works naturally -- params stays a proxy, params.customerId
+// becomes a real array.
+//
+// The price is that the array is a snapshot of the golang slice:
+//
+//   - elements are converted when the slice is handed over or read, so a large
+//     slice costs O(n) on every read (the proxy converts nothing up front);
+//   - writes from javascript (v[0] = x, v.push(x)) stay in javascript and never
+//     reach the golang slice -- that is what pushes a caller to copy the slice
+//     first when javascript really wants to edit it;
+//   - reading the same slice twice yields two independent arrays.
+//
+// A []byte is deliberately NOT affected: it keeps travelling as a string (also
+// when wrapped in an interface or a pointer), because turning it into an array
+// of numbers would silently change every value that decodes to bytes.
+//
+// This option is ON by default for the file-cache entry points
+// (LoadFileFromCache / LoadFileFromCacheWith), so scripts loaded through them
+// get array semantics without any setup. NewContext is unaffected: a Context
+// you build yourself only gets it if you ask for it. Pass WithoutSlicesAsArrays
+// to turn it back off in a cache entry point.
+func WithSlicesAsArrays() Option { return func(o *options) { o.slicesAsArrays = true } }
+
+// WithoutSlicesAsArrays undoes WithSlicesAsArrays. It exists because the file
+// cache turns the option on by default: use it to keep golang slices as lazy,
+// writable GoObject proxies in a Context built by LoadFileFromCache or
+// LoadFileFromCacheWith. Options are applied left to right, so the last one
+// wins:
+//
+//	ctx, _, err := qjs.LoadFileFromCacheWith("rules.js", nil,
+//	    []qjs.Option{qjs.WithoutSlicesAsArrays()}, scriptHome...)
+//
+// With the option off a slice is array-like again (v.length, v[i], for...in,
+// Object.keys, Array.from work) but Array.isArray/instanceof/forEach/spread do
+// not, and it keeps the proxy's write-back behaviour.
+func WithoutSlicesAsArrays() Option { return func(o *options) { o.slicesAsArrays = false } }
+
 // New creates a jsRuntime together with its single Context and returns the
 // Context. It is the same object the underlying jsRuntime hosts (1:1).
 func NewContext(opts ...Option) (*Context, error) {
@@ -262,7 +323,8 @@ func newRuntime(opts ...Option) (*Context, error) {
 	}
 
 	ctx := &Context{
-		values: make(map[uint64]C.JSValue),
+		values:         make(map[uint64]C.JSValue),
+		slicesAsArrays: o.slicesAsArrays,
 		eng: &engine{
 			tasks: make(chan func(), 64),
 			quit:  make(chan struct{}),

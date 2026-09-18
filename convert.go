@@ -111,6 +111,11 @@ func toJsValue(c *Context, v interface{}) (C.JSValue, error) {
 // proxies standing for the original golang value, so js code walks them to
 // any depth with plain js syntax, calls their exported methods and writes
 // fields back -- without any depth limit and without copying.
+//
+// WithSlicesAsArrays changes one thing: a slice or an array then travels as a
+// real js Array (a snapshot, see sliceToJsArray) instead of a proxy, so that
+// Array.isArray and the array methods keep working on golang data. Maps,
+// structs and functions are unaffected.
 func reflectToJs(c *Context, rv reflect.Value) (C.JSValue, error) {
 	switch rv.Kind() {
 	case reflect.Interface, reflect.Ptr:
@@ -120,6 +125,15 @@ func reflectToJs(c *Context, rv reflect.Value) (C.JSValue, error) {
 		e := rv.Elem()
 		switch e.Kind() {
 		case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+			if c.slicesAsArrays && (e.Kind() == reflect.Slice || e.Kind() == reflect.Array) {
+				// Recurse on the pointed-to / wrapped value instead of proxying
+				// the interface or pointer, so that it lands in the slice/array
+				// case below and becomes a real js Array. This is the path a
+				// json body takes: the value inside a map[string]interface{} is
+				// an interface{}, and it is here that its slice has to become
+				// an array rather than a proxy.
+				return reflectToJs(c, e)
+			}
 			// the proxy stands for the original value: the pointer itself
 			// for a pointer (writes reach the caller), the wrapped value
 			// for an interface
@@ -149,8 +163,14 @@ func reflectToJs(c *Context, rv reflect.Value) (C.JSValue, error) {
 		if rv.IsNil() {
 			return C.qjs_null(), nil
 		}
+		if c.slicesAsArrays {
+			return sliceToJsArray(c, rv)
+		}
 		return makeProxy(c, rv), nil
 	case reflect.Array:
+		if c.slicesAsArrays {
+			return sliceToJsArray(c, rv)
+		}
 		return makeProxy(c, rv), nil
 	case reflect.Map:
 		if rv.IsNil() {
@@ -175,6 +195,52 @@ func reflectToJs(c *Context, rv reflect.Value) (C.JSValue, error) {
 	default:
 		return C.qjs_undefined(), fmt.Errorf("qjs: unsupported type %s", rv.Type())
 	}
+}
+
+// sliceToJsArray materialises a golang slice or array as a real js Array. It is
+// the WithSlicesAsArrays path, and it is the only way to make javascript see a
+// golang slice as an array: quickjs tells arrays apart by class id alone
+// (JS_IsArray compares p->class_id to JS_CLASS_ARRAY), and its built-in Array
+// class has no exotic-method slot, so a value cannot be both lazily proxied and
+// a real array. An array therefore has to be filled in, element by element.
+//
+// The elements go through exactly the same conversion a proxied slice uses when
+// its elements are read, so element values keep the proxy treatment: an element
+// that is itself a map or a struct stays a lazy, writable GoObject, while a
+// nested slice becomes a nested array.
+//
+// The array is a snapshot: nothing is written back, and the same golang slice
+// read twice yields two independent arrays. See WithSlicesAsArrays.
+func sliceToJsArray(c *Context, rv reflect.Value) (C.JSValue, error) {
+	if !c.enterConv() {
+		// A slice that contains itself (directly or through a map) would
+		// recurse forever. Past the depth limit, fall back to the proxy: it is
+		// the one representation that walks such a value on demand instead of
+		// up front, so the conversion terminates. Only a slice this deeply
+		// nested -- 64 levels -- loses array semantics, which is a far better
+		// outcome than a stack overflow.
+		return makeProxy(c, rv), nil
+	}
+	defer c.leaveConv()
+
+	n := rv.Len()
+	arr := C.qjs_new_array(c.c)
+	if C.JS_IsException(arr) != 0 {
+		return C.qjs_undefined(), c.takeError()
+	}
+	for i := 0; i < n; i++ {
+		ev, err := reflectToJs(c, rv.Index(i))
+		if err != nil {
+			// freeing the array releases the elements set so far
+			C.JS_FreeValue(c.c, arr)
+			return C.qjs_undefined(), err
+		}
+		if C.JS_SetPropertyUint32(c.c, arr, C.uint32_t(i), ev) < 0 { // consumes ev
+			C.JS_FreeValue(c.c, arr)
+			return C.qjs_undefined(), c.takeError()
+		}
+	}
+	return arr, nil
 }
 
 // maxConvDepth caps how deep a javascript value is walked when it is turned

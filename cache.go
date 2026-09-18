@@ -40,18 +40,26 @@ func InitCache() {
 // 的 PATH。文件自身所在目录永远最先被搜索，所以脚本 import 旁边的文件不需要
 // 任何配置。
 //
-// require() 在这个入口里默认打开（等价于内部加了 WithRequire()），缓存的
-// Context 可以直接用 CommonJS 模块。
+// 这个入口默认打开两件事（内部等价于加了 WithRequire() 和
+// WithSlicesAsArrays()）：
 //
-// 返回的 Context 是共享的：命中缓存时多个 goroutine 会拿到同一个实例。但
-// QuickJS 的 runtime 是严格单线程的——默认情况下这个共享 Context 只能由"同一
-// 时刻一个 goroutine"驱动（内部已串行化，但 Go 可能在两次 cgo 调用之间把
-// goroutine 迁移到别的 OS 线程，从而破坏 C 栈守卫并导致 qjs_call 内 SIGSEGV）。
-// 若要让同一个缓存 Context 被多个 goroutine 真正并发安全地使用，请用
-// LoadFileFromCacheWith 并带上 qjs.WithThreadPinning()；该选项会在每次引擎操作
-// 期间把执行钉在单一 OS 线程上，配合已有的串行化锁彻底消除跨线程崩溃。
+//   - require()：缓存的 Context 可以直接用 CommonJS 模块；
+//   - 切片即数组：golang 切片 / json 数组以真 JS Array 交给脚本，所以
+//     Array.isArray / instanceof / forEach / map / spread / for...of 都能用，
+//     JSON.stringify 得到 [...] 而不是 {"0":...}。
+//
+// 第二条是有代价的：数组是**快照**，每次读都重新物化（大切片 O(n)/次），
+// JS 侧的写入不再回写 Go 切片，同一 Go 切片读两次得到两个独立数组。要旧的
+// 惰性代理行为（可写回、无物化开销）就用 LoadFileFromCacheWith 传
+// qjs.WithoutSlicesAsArrays()。细节见 WithSlicesAsArrays 的说明。
+//
+// 返回的 Context 是共享的：命中缓存时多个 goroutine 会拿到同一个实例，且可以
+// 被并发调用。go-quickjs 把每个 Context 绑定到一条专属 engine goroutine（并
+// 终身钉死在同一个 OS 线程）上，所有 C 操作都在该线程串行执行，因此跨线程
+// SIGSEGV 已被根治，无需任何额外选项。历史选项 qjs.WithThreadPinning() 现在
+// 是空操作，保留只为兼容。
 func LoadFileFromCache(path string, vars map[string]interface{}, scriptHome ...string) (ctx *Context, existing bool, err error) {
-	return loadFileFromCache(path, vars, []Option{WithRequire()}, scriptHome)
+	return loadFileFromCache(path, vars, cacheDefaults(nil), scriptHome)
 }
 
 // LoadFileFromCacheWith 是带额外 Option 的 LoadFileFromCache：
@@ -59,20 +67,30 @@ func LoadFileFromCache(path string, vars map[string]interface{}, scriptHome ...s
 //	ctx, _, err := qjs.LoadFileFromCacheWith("rules.js", nil,
 //	    []qjs.Option{qjs.WithMemoryLimit(1 << 20)}, "/opt/js-libs")
 //
-// 并发安全提示：要让同一个缓存 Context 被多个 goroutine 同时驱动（例如
-// fasthttp 这类多 worker 服务），请务必带上 qjs.WithThreadPinning()：
-//
+//	// 退回惰性代理（切片可写回 Go、无物化开销）：
 //	ctx, _, err := qjs.LoadFileFromCacheWith("rules.js", nil,
-//	    []qjs.Option{qjs.WithThreadPinning()}, scriptHome...)
+//	    []qjs.Option{qjs.WithoutSlicesAsArrays()}, scriptHome...)
 //
-// require() 已经在两个入口里默认打开，不必再传 qjs.WithRequire()。
+// require() 与「切片即数组」已经在两个入口里默认打开，不必再传
+// qjs.WithRequire() / qjs.WithSlicesAsArrays()。传进来的 Option 排在默认项
+// 之后、逐个应用，所以后写的生效 —— 这正是 WithoutSlicesAsArrays() 关得掉
+// 默认值的原因。
+//
+// 并发安全不需要额外选项（见 LoadFileFromCache 的说明）；历史选项
+// qjs.WithThreadPinning() 现在只是空操作，继续传也无害。
+//
 // 搜索目录仍是最后一个变参。Option 也参与缓存键，同一文件用不同 Option
 // 加载不会共用 Context。
 func LoadFileFromCacheWith(path string, vars map[string]interface{}, opts []Option, scriptHome ...string) (*Context, bool, error) {
-	all := make([]Option, 0, len(opts)+1)
-	all = append(all, WithRequire())
-	all = append(all, opts...)
-	return loadFileFromCache(path, vars, all, scriptHome)
+	return loadFileFromCache(path, vars, cacheDefaults(opts), scriptHome)
+}
+
+// cacheDefaults prepends the options every cache entry point implies. Order
+// matters: caller options come last so they win (see WithoutSlicesAsArrays).
+func cacheDefaults(opts []Option) []Option {
+	all := make([]Option, 0, len(opts)+2)
+	all = append(all, WithRequire(), WithSlicesAsArrays())
+	return append(all, opts...)
 }
 
 func loadFileFromCache(path string, vars map[string]interface{}, opts []Option, scriptHome []string) (ctx *Context, existing bool, err error) {
