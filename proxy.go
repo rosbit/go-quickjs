@@ -461,7 +461,7 @@ func goObjSet(ctx *C.JSContext, obj C.JSValueConst, atom C.JSAtom, value C.JSVal
 		return 0
 	}
 	if err := goObjSetInner(c, rv, atomKey(c, atom), value); err != nil {
-		C.qjs_throw_error(ctx, ccstr(err.Error()))
+		throwError(ctx, err.Error())
 		return -1
 	}
 	return 1

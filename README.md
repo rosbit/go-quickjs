@@ -1,157 +1,144 @@
 # go-quickjs, make quickjs be embedded easily
 
-[QuickJS](https://bellard.org/quickjs/) is a small and embeddable Javascript engine written by [Fabrice Bellard](https://bellard.org).
-
-`go-quickjs` is a package wrapping quickjs and making it a **pragmatic embeddable** language.
-With some helper functions provided by `go-quickjs`, calling Golang functions from Javascript, 
-or calling Javascript functions from Golang are both very simple. So, with the help of `go-quickjs`, quickjs
-can be embedded in Golang application easily.
-
-### Install
-
-The package is fully go-getable, So, just type
+[QuickJS](https://bellard.org/quickjs/) is a small embeddable javascript engine
+written by [Fabrice Bellard](https://bellard.org): no JIT, a few hundred KB of
+code, and a startup cost measured in microseconds. `go-quickjs` wraps it so a Go
+program can run javascript, hand it Go values and let javascript call back into
+Go, without meeting the sharp edges that usually come with a cgo binding.
 
   `go get github.com/rosbit/go-quickjs`
 
-to install.
+```go
+ctx, err := quickjs.NewContext()
+defer ctx.Close()
 
-### Usage
+res, _ := ctx.Eval("a + b", map[string]interface{}{"a": 10, "b": 1})
+fmt.Println(res)   // 11
+```
 
-#### 1. Evaluates expressions
+## What this wrapper is for
+
+### Calling across the boundary, one line each way
 
 ```go
-package main
+// Go -> javascript: load a file, bind its function to a Go func variable
+ctx.EvalFile("a.js", nil)
+var add func(int, int) int
+ctx.BindFunc("add", &add)
+fmt.Println(add(1, 2))
 
-import (
-  "github.com/rosbit/go-quickjs"
-  "fmt"
-)
-
-func main() {
-  ctx, err := quickjs.NewContext()
-  if err != nil {
-    fmt.Printf("%v\n", err)
-    return
-  }
-
-  res, _ := ctx.Eval("a + b", map[string]interface{}{
-     "a": 10,
-     "b": 1,
-  })
-  fmt.Println("result is:", res)
-}
+// javascript -> Go: inject a Go func into the global scope
+ctx.Set("hostAdd", func(a, b int) int { return a + b })
+ctx.Eval(`hostAdd(2, 3)`)   // 5
 ```
 
-#### 2. Go calls Javascript function
+Errors cross the boundary intact, in both directions: a Go function that returns
+a non-nil `error` throws inside javascript, and a javascript exception reaches Go
+as a `*quickjs.Error` carrying `Name`, `Message` and the javascript `Stack`.
 
-Suppose there's a Javascript file named `a.js` like this:
+### A Context is safe to share between goroutines
 
-```javascript
-function add(a, b) {
-    return a+b
-}
-```
-
-one can call the Javascript function `add()` in Go code like the following:
+The cache entry points hand the same `*Context` to every caller, so an HTTP
+service can use it straight from its workers:
 
 ```go
-package main
-
-import (
-  "github.com/rosbit/go-quickjs"
-  "fmt"
-)
-
-var add func(int, int)int
-
-func main() {
-  ctx, err := quickjs.NewContext()
-  if err != nil {
-     fmt.Printf("%v\n", err)
-     return
-  }
-
-  if _, err = ctx.EvalFile("a.js", nil); err != nil {
-     fmt.Printf("%v\n", err)
-     return
-  }
-
-  // method 1: bind JS function with a golang var
-  if err = ctx.BindFunc("add", &add); err != nil {
-     fmt.Printf("%v\n", err)
-     return
-  }
-  res := add(1, 2)
-
-  // method 2: call JS function using CallFunc
-  // res, err := ctx.CallFunc("add", 1, 2)
-  // if err != nil {
-  //   fmt.Printf("%v\n", err)
-  //   return
-  // }
-
-  fmt.Println("result is:", res)
-}
+ctx, existing, err := quickjs.LoadFileFromCache("rules.js", nil, "/opt/js-libs")
 ```
 
-#### 3. Javascript calls Go function
+That is safe because every Context owns a dedicated engine goroutine pinned to a
+single OS thread, and every C call is routed onto it: quickjs is never touched
+from two threads at once, and no finalizer frees a value on a foreign thread.
+There is no global lock, so separate contexts do not serialise against each
+other. (The historical `WithThreadPinning()` option is a no-op kept for
+compatibility.)
 
-Javascript calling Go function is also easy. In the Go code, make a Golang function
-as Javascript global function by calling `EvalFile` by registering. There's the example:
+### Scripts load once and reload when the file changes
+
+`LoadFileFromCache` keys on the path, the search directories and the options:
+the first call evaluates the file, later calls reuse the same Context, and a
+changed mtime drops the old one and rebuilds it (`existing=false` reports that).
+`ClearCache()` releases everything.
+
+### Go values are handed over lazily, not copied
+
+Maps, slices, arrays, structs and pointers arrive in javascript as a proxy: walk
+to any depth, call exported methods, assign to fields, and the write reaches the
+original Go value. Nothing is converted up front, so there is no depth limit and
+cyclic data is fine. Exported names are also reachable lower-cased
+(`Name` -> `name`, `HTTPStatus` -> `httpStatus`).
 
 ```go
-package main
-
-import (
-    "github.com/rosbit/go-quickjs"
-    "fmt"
-)
-
-// function to be called by Javascript
-func adder(a1 float64, a2 float64) float64 {
-    return a1 + a2
-}
-
-func main() {
-  ctx, err := quickjs.NewContext()
-  if err != nil {
-      fmt.Printf("%v\n", err)
-      return
-  }
-
-  if _, err = ctx.EvalFile("b.js", map[string]interface{}{
-      "adder": adder,  // b.js containing code calling "adder"
-  }); err != nil {
-      fmt.Printf("%v\n", err)
-  }
-}
+ctx.Set("me", &Person{Name: "gopher", Age: 3})
 ```
-
-In Javascript code, one can call the registered function directly. There's the example `b.js`.
 
 ```javascript
-r = adder(1, 100)   // the function "adder" is implemented in Go
-console.log(r)
+me.name          // "gopher"
+me.greet("hi")   // methods are called on the Go value
+me.age = 4       // writes through to the Go struct
+console.log(me)  // {Name: gopher, Age: 4, Greet: [Function: Greet]}
 ```
 
-### Inspecting Go values with console.log
+### ...except slices, which can be real javascript arrays
 
-Go values passed to JS (maps, structs, pointers) are handed over with all
-fields at any nesting depth, and struct methods are callable as JS functions.
-`console.log` renders them so they can be inspected directly: fields are
-listed and methods show up as `[Function: Name]` instead of `undefined`.
+A proxied slice is array-*like* but not an `Array`, which matters as soon as the
+script uses array methods. `WithSlicesAsArrays()` materialises slices and arrays
+as genuine javascript arrays:
 
-```javascript
-console.log(me)   // me is a *Person set from Go
-// {Greet: [Function: Greet], age: 18, greet: [Function: Greet], name: 绿兵, ...}
-me.greet("hi")    // methods are called on the original Go value
-```
+|                                     | proxy (default for `NewContext`) | with `WithSlicesAsArrays()` |
+| --- | --- | --- |
+| `v.length`, `v[0]`, `for...in`      | array-like, works                | works                        |
+| `Array.isArray(v)`, `instanceof`    | `false`                          | `true`                       |
+| `v.forEach` / `map` / `filter`      | `undefined`                      | works                        |
+| `[...v]`, `for (x of v)`            | throws "not iterable"            | works                        |
+| `JSON.stringify(v)`                 | `{"0":1,"1":2}`                  | `[1,2]`                      |
 
-### Status
+The cache entry points (`LoadFileFromCache`, `LoadFileFromCacheWith`) turn it on
+by default, because that is what scripts expect; pass `WithoutSlicesAsArrays()`
+to get the lazy proxy back. `NewContext()` is unaffected and stays lazy unless
+asked. The price of the array form is that it is a snapshot: reads re-materialise
+it and javascript writes no longer reach the Go slice. `[]byte` is deliberately
+never affected -- it keeps travelling as a string.
 
-The package is not fully tested, so be careful.
+### Modules, both flavours
 
-### Contribution
+ESM `import` works, with a PATH-like list of search directories so scripts can
+say `import { f } from "mylib"`; a module next to the entry file resolves with no
+configuration at all. CommonJS is one option away in `NewContext` (already on in
+the cache entry points) and gives scripts a global `require()` with
+`node_modules` lookup, `.json` support and `require.cache`.
 
-Pull requests are welcome! Also, if you want to discuss something send a pull request with proposal and changes.
+### Bounded resources, no leaks
+
+`WithMemoryLimit`, `WithGCThreshold` and `WithMaxStackSize` bound what a script
+can consume; Go functions and closures handed to javascript are released by
+finalizers when javascript drops them, so long-running processes do not grow.
+`console.log` is wired to a writer of your choice (`WithConsoleWriter`), plus a
+global `print`. Log lines are coloured by value type (strings red, numbers
+yellow, objects cyan, `undefined`/`null` grey) with no TTY detection, so redirect
+the writer when you want them plain.
+
+## Notes
+
+### Numbers
+
+Integers come back as `int64`, the rest as `float64`. Because quickjs uses
+NaN-boxing, a floating point result that happens to be integral (`1.5 + 0.5`)
+also arrives as `int64`, so accept both -- `reflect.ValueOf(v).Float()` is a
+convenient normaliser.
+
+### Layout
+
+`csrc/` holds a self-contained copy of the quickjs C sources; all includes point
+at it, so upgrading quickjs means replacing that directory and nothing else.
+
+## Status
+
+The behaviours described above are covered by a test suite that runs with
+`-race`, including the concurrency and finalizer paths. The quickjs C sources in
+`csrc/` are upstream's, embedded as-is.
+
+## Contribution
+
+Pull requests are welcome! Also, if you want to discuss something send a pull
+request with proposal and changes.
 __Convention:__ fork the repository and make changes on your fork in a feature branch.

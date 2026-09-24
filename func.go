@@ -163,7 +163,7 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 
 	defer func() {
 		if r := recover(); r != nil {
-			ret = C.qjs_throw_error(ctx, ccstr(fmt.Sprintf("panic in go function: %v", r)))
+			ret = throwError(ctx, fmt.Sprintf("panic in go function: %v", r))
 		}
 	}()
 
@@ -182,7 +182,7 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 	id := C.restoreGoFuncId(*funcData)
 	gf := c.rt.funcs.get(uint32(id))
 	if gf == nil || gf.fn.Kind() != reflect.Func {
-		return C.qjs_throw_error(ctx, ccstr("qjs: go function no longer available"))
+		return throwError(ctx, "qjs: go function no longer available")
 	}
 
 	if c.closed {
@@ -193,7 +193,7 @@ func qjsGoFuncCallback(ctx *C.JSContext, thisVal C.JSValueConst, argc C.int,
 		return C.qjs_get_value(argv, C.int(i))
 	})
 	if err != nil {
-		return C.qjs_throw_error(ctx, ccstr(err.Error()))
+		return throwError(ctx, err.Error())
 	}
 
 	out := gf.fn.Call(args)
@@ -255,14 +255,14 @@ func goResultsToJs(c *Context, out []reflect.Value) C.JSValue {
 			if out[0].IsNil() {
 				return C.qjs_undefined()
 			}
-			return C.qjs_throw_error(c.c, ccstr(out[0].Interface().(error).Error()))
+			return throwError(c.c, out[0].Interface().(error).Error())
 		}
 		return toJsResult(c, out[0])
 	default:
 		last := out[len(out)-1]
 		if last.Type() == errorType {
 			if !last.IsNil() {
-				return C.qjs_throw_error(c.c, ccstr(last.Interface().(error).Error()))
+				return throwError(c.c, last.Interface().(error).Error())
 			}
 			if len(out) == 2 {
 				return toJsResult(c, out[0])

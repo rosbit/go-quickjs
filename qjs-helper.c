@@ -77,13 +77,29 @@ JSValue qjs_new_go_func(JSContext *ctx, int length, uint32_t id) {
     return f;
 }
 
-JSValue qjs_throw_error(JSContext *ctx, const char *msg) {
+/*
+ * Raise a js Error whose message is exactly the len bytes at msg, and return
+ * JS_EXCEPTION.
+ *
+ * The length is explicit because the message is normally a golang string's
+ * bytes: JS_NewStringLen copies exactly len bytes and never scans for a
+ * terminator, so the caller needs neither a NUL nor a temporary C string.
+ *
+ * Do NOT replace this with JS_NewString/strlen (the old qjs_throw_error): a
+ * golang string is not NUL-terminated, so strlen walks past its end into
+ * whatever the process has mapped next. That produced messages stitched
+ * together with unrelated rodata (measured: a 16539-byte "message" for a
+ * 7-byte error) and could fault when the walk crossed a page boundary.
+ *
+ * msg may be NULL when len is 0.
+ */
+JSValue qjs_throw_error_len(JSContext *ctx, const char *msg, size_t len) {
     JSValue e = JS_NewError(ctx);
     if (JS_IsException(e)) {
         return e;
     }
     JS_DefinePropertyValueStr(ctx, e, "message",
-                              JS_NewString(ctx, msg), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                              JS_NewStringLen(ctx, msg, len), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     return JS_Throw(ctx, e);
 }
 

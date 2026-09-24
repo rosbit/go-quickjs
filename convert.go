@@ -23,13 +23,23 @@ var (
 
 func cLength() *C.char { return C.qjs_length_str }
 
-// ccstr returns a pointer to the bytes of s; quickjs copies what it needs.
-func ccstr(s string) *C.char {
+// throwError raises a js Error carrying exactly s as its message and returns
+// JS_EXCEPTION.
+//
+// The bytes of s are handed to quickjs together with their length, and
+// JS_NewStringLen copies exactly that many bytes, so the string does not have
+// to be NUL-terminated and nothing is allocated on the golang side. Using a
+// C-string based helper instead (qjs_throw_error) makes quickjs strlen past the
+// end of the golang string: the message comes out stitched together with
+// whatever the process has mapped after it, and reading across an unmapped page
+// faults.
+func throwError(ctx *C.JSContext, s string) C.JSValue {
 	if len(s) == 0 {
-		return nil
+		return C.qjs_throw_error_len(ctx, nil, 0)
 	}
-	return (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
+	return C.qjs_throw_error_len(ctx, (*C.char)(unsafe.Pointer(unsafe.StringData(s))), C.size_t(len(s)))
 }
+
 func cMessage() *C.char { return C.qjs_message_str }
 func cName() *C.char    { return C.qjs_name_str }
 func cStack() *C.char   { return C.qjs_stack_str }
