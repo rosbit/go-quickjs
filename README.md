@@ -29,7 +29,7 @@ fmt.Println(add(1, 2))
 
 // javascript -> Go: inject a Go func into the global scope
 ctx.Set("hostAdd", func(a, b int) int { return a + b })
-ctx.Eval(`hostAdd(2, 3)`)   // 5
+ctx.Eval(`hostAdd(2, 3)`, nil)   // 5
 ```
 
 Errors cross the boundary intact, in both directions: a Go function that returns
@@ -51,6 +51,37 @@ from two threads at once, and no finalizer frees a value on a foreign thread.
 There is no global lock, so separate contexts do not serialise against each
 other. (The historical `WithThreadPinning()` option is a no-op kept for
 compatibility.)
+
+### ...but never call in from a goroutine the script is waiting for
+
+One engine thread has one consequence: a call *into* javascript started from
+another goroutine is queued behind whatever the engine thread is running, and
+only happens when that finishes. That is fine when the waiting is not circular --
+`Set`, `Eval`, `Call`, `BindFunc` and `Close` from any goroutine just queue up,
+and a fire-and-forget callback from a goroutine simply runs later. It deadlocks
+when the wait is circular: **javascript -> golang -> goroutine -> javascript**,
+where the script is blocked waiting for that goroutine.
+
+```go
+// correct: called from javascript, runs inline on the engine thread
+func RunSQL(sql string, perRow func(rec map[string]interface{})) string {
+	for _, rec := range rows {
+		perRow(rec)
+	}
+}
+
+// deadlock: the js call is queued behind the script that waits for this
+// goroutine, and the script waits for the goroutine to produce a row
+go func() {
+	perRow(rec)   // <- submits to the engine thread, blocked there
+	close(ch)
+}()
+<-ch
+```
+
+The fix belongs in the golang side: resolve anything javascript-backed *before*
+handing work to the goroutine, and let the goroutine use plain golang values
+after that.
 
 ### Scripts load once and reload when the file changes
 
@@ -77,6 +108,36 @@ me.greet("hi")   // methods are called on the Go value
 me.age = 4       // writes through to the Go struct
 console.log(me)  // {Name: gopher, Age: 4, Greet: [Function: Greet]}
 ```
+
+A struct field read through the proxy arrives as a *value*. Javascript cannot
+tell the difference, but Go can when the value travels back: if the target type
+is an interface that only the *pointer* implements -- the method sits on a
+pointer receiver -- the address of that field is handed over instead. It points
+at the original field, so the callee writes through to it.
+
+```go
+type Sink struct{ n int }
+
+func (s *Sink) Write(p []byte) (int, error) { s.n += len(p); return len(p), nil }
+
+type Holder struct{ Sink Sink }
+
+holder := &Holder{}
+var got io.Writer
+
+ctx.Set("holder", holder)
+ctx.Set("takeSink", func(w io.Writer) { got = w })
+ctx.Eval("takeSink(holder.sink)", nil)
+
+got.Write([]byte("hello"))   // *Sink, the address of the original field: n == 5
+```
+
+`io.Writer` is implemented by `*Sink` and never by the `Sink` value that a field
+read yields, so it is the address that crosses the boundary: a value field whose
+pointer implements the interface behaves like a pointer field.
+
+Values whose address cannot be taken (a map element, for instance) cannot be
+converted that way, so the call keeps handing back the zero value.
 
 ### ...except slices, which can be real javascript arrays
 

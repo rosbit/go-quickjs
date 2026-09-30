@@ -10,7 +10,7 @@ import (
 	qjs "github.com/rosbit/go-quickjs"
 )
 
-// TestBindFuncPerRequestCrashRepro mirrors the remote-funcs service exactly:
+// TestBindFuncPerRequestCrashRepro mirrors a request-serving service exactly:
 // a *single* cached, shared Context (LoadFileFromCacheWith + WithThreadPinning)
 // is driven by many goroutines, and *every* request re-binds a js global to a
 // Go func var (vm.BindFunc) and then calls it. The bound js function calls back

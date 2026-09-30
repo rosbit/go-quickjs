@@ -80,15 +80,15 @@ func TestContextGC(t *testing.T) {
 }
 
 // TestProxiedFuncsAreReleasedWithTheJsFunction locks in the leak that made a
-// long-running db-pusher process grow without bound.
+// long-running process grow without bound.
 //
-// Reading a func out of a proxied golang map or struct -- every
-// `clog.error(...)`, every `db.runSQL(...)` in a script that drives golang
-// through namespaced builtins -- builds a brand new js function, and each of
-// those used to occupy a registry entry for the whole life of the context:
-// nothing ever told golang that javascript had dropped the function. A script
-// calling such a builtin from inside its row loop therefore leaked one entry
-// per row, forever, on a context that LoadFileFromCache keeps alive.
+// Reading a func out of a proxied golang map or struct -- which is how a
+// script reaches a namespaced builtin, `log.info(...)` say -- builds a brand
+// new js function, and each of those used to occupy a registry entry for the
+// whole life of the context: nothing ever told golang that javascript had
+// dropped the function. A script calling such a builtin from inside its row
+// loop therefore leaked one entry per row, forever, on a context that
+// LoadFileFromCache keeps alive.
 //
 // The release is driven by the finalizer of the wrapper the registry id
 // travels in, so it takes a quickjs collection to observe: the loop below
@@ -106,12 +106,12 @@ func TestProxiedFuncsAreReleasedWithTheJsFunction(t *testing.T) {
 	// the shape that leaked. Registered as plain globals they would be
 	// converted once and prove nothing.
 	vars := map[string]interface{}{
-		"clog": map[string]interface{}{
+		"log": map[string]interface{}{
 			"error": func(string) {},
 			"info":  func(string) {},
 		},
 		"utils": map[string]interface{}{
-			"fen2yuan": func(f float64) float64 { return f / 100 },
+			"halve": func(f float64) float64 { return f / 2 },
 		},
 	}
 	if _, err := ctx.Eval("1", vars); err != nil {
@@ -120,7 +120,7 @@ func TestProxiedFuncsAreReleasedWithTheJsFunction(t *testing.T) {
 	base := ctx.rt.funcs.size()
 
 	script := fmt.Sprintf("var total = 0; for (var i = 0; i < %d; i++) { "+
-		"total += utils.fen2yuan(i); if (i %% 1000 === 0) clog.info('tick'); } total", calls)
+		"total += utils.halve(i); if (i %% 1000 === 0) log.info('tick'); } total", calls)
 	if _, err := ctx.Eval(script, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -31,9 +31,9 @@ func asFloat64(x interface{}) (float64, bool) {
 }
 
 // TestThreadPinningSharedContext drives a single Context -- created with
-// WithThreadPinning -- from many goroutines at once. This reproduces the
-// remote-funcs crash: LoadFileFromCache hands out one shared Context and
-// fasthttp drives it from several worker threads. Without thread pinning the
+// WithThreadPinning -- from many goroutines at once. This reproduces the crash a
+// cache-backed service hits: LoadFileFromCache hands out one shared Context and
+// its request workers drive it from several threads. Without thread pinning the
 // runtime is touched from different OS threads (with goroutine migration between
 // cgo calls) and dies inside qjs_call; WithThreadPinning pins each operation to
 // a stable OS thread, so the shared Context survives. Run with -race.
@@ -94,10 +94,10 @@ func TestThreadPinningSharedContext(t *testing.T) {
 	}
 }
 
-// TestThreadPinningGoesThroughCache mirrors the app's usage: a Context built via
-// LoadFileFromCacheWith with WithThreadPinning, then hammered from many
-// goroutines. It proves the option flows through the cache path and keeps the
-// shared cached Context safe under concurrent use.
+// TestThreadPinningGoesThroughCache mirrors a cache-backed service: a Context
+// built via LoadFileFromCacheWith with WithThreadPinning, then hammered from
+// many goroutines. It proves the option flows through the cache path and keeps
+// the shared cached Context safe under concurrent use.
 func TestThreadPinningGoesThroughCache(t *testing.T) {
 	const workers = 8
 	const rounds = 100

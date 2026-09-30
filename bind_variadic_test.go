@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// fnPushLike mirrors the user's real signature: trailing variadic strings.
+// fnPushLike mirrors a real-world signature: trailing variadic strings.
 // The bound js function must receive each variadic element as an individual
 // javascript argument, never the slice as one value.
 type fnPushLike func(name string, n int, updating bool, args ...string) string
@@ -22,7 +22,7 @@ func TestBindFuncVariadicSpread(t *testing.T) {
 	var regex = /^\d{4}-\d{2}$/;
 	function pushMonth(name, n, updating) {
 		var args = Array.prototype.slice.call(arguments, 3);
-		if (args.length < 1) { return "Usage: db-pusher <month>"; }
+		if (args.length < 1) { return "Usage: push <month>"; }
 		month = args[0];
 		if (!regex.test(month)) { throw new Error("Invalid month format: got " + typeof month + " " + String(month)); }
 		return args.join("|");
@@ -35,13 +35,13 @@ func TestBindFuncVariadicSpread(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := goFn("count-staff-in-month", 3, false, "2026-09", "extra")
+	got := goFn("run-task", 3, false, "2026-09", "extra")
 	if got != "2026-09|extra" {
 		t.Fatalf("variadic args not spread: got %q", got)
 	}
 
 	// empty variadic must not panic or inject a stray argument
-	if got := goFn("x", 1, true); got != "Usage: db-pusher <month>" {
+	if got := goFn("x", 1, true); got != "Usage: push <month>" {
 		t.Fatalf("empty variadic: got %q", got)
 	}
 }

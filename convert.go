@@ -347,6 +347,23 @@ func jsToGo(c *Context, jsVal C.JSValue, t reflect.Type) (reflect.Value, error) 
 		if reflect.TypeOf(iv).AssignableTo(t) {
 			return rv, nil
 		}
+		// A method declared on a pointer receiver is not in the method set of
+		// the value, so a value read out of a proxied golang value can satisfy
+		// the target type only through its address. That is what a caller
+		// expecting an interface such as io.Writer runs into: the field holds
+		// a value, only *T implements the interface, so without this the
+		// lookup fails and the parameter silently keeps its zero value.
+		//
+		// A struct field is addressable (see derefValue + makeProxy), so the
+		// address taken below points at the very field of the original golang
+		// value: writing through it reaches the caller. Nothing changes for a
+		// value the target already accepted, nor for a non-addressable one
+		// (a map element, say), which keeps failing exactly as before.
+		if rv.CanAddr() {
+			if pv := rv.Addr(); pv.Type().AssignableTo(t) {
+				return pv, nil
+			}
+		}
 	}
 
 	if C.qjs_is_undefined(jsVal) != 0 || C.qjs_is_null(jsVal) != 0 {

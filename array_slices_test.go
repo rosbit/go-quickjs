@@ -233,9 +233,8 @@ func TestSlicesAsArraysThroughFileCache(t *testing.T) {
 }
 
 // TestSlicesAsArraysOnByDefaultInFileCache pins the cache entry points'
-// default: LoadFileFromCache alone -- no options passed at all, which is how
-// db-pusher and cangqiong-syncer call it -- already gives scripts real js
-// arrays, require() included.
+// default: LoadFileFromCache alone -- no options passed at all -- already gives
+// scripts real js arrays, require() included.
 func TestSlicesAsArraysOnByDefaultInFileCache(t *testing.T) {
 	dir := t.TempDir()
 	script := dir + "/default.js"
@@ -385,7 +384,7 @@ func TestFileCacheEntryPointsShareOneContext(t *testing.T) {
 			existing, sameDefaults == plain)
 	}
 
-	// the option list remote-funcs passes: behaviour equal, cache entry not
+	// an explicit option list: behaviour equal, cache entry not
 	explicit, _, err := LoadFileFromCacheWith(script, vars,
 		[]Option{WithThreadPinning(), WithSlicesAsArrays()})
 	if err != nil {
